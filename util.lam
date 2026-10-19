@@ -1,0 +1,284 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+
+from lamerrors import Result
+from .errors import StripeError
+from .models import StripeResponse
+
+go! {
+    import (
+        "fmt"
+        "net/url"
+        "reflect"
+        "sort"
+        "strconv"
+    )
+
+    func stripeDeref(v reflect.Value) reflect.Value {
+        for v.IsValid() && (v.Kind() == reflect.Interface || v.Kind() == reflect.Ptr) {
+            if v.IsNil() {
+                return reflect.Value{}
+            }
+            v = v.Elem()
+        }
+        return v
+    }
+
+    func stripeScalar(v reflect.Value) (string, bool) {
+        if !v.IsValid() {
+            return "", false
+        }
+        switch v.Kind() {
+        case reflect.String:
+            return v.String(), true
+        case reflect.Bool:
+            return strconv.FormatBool(v.Bool()), true
+        case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+            return strconv.FormatInt(v.Int(), 10), true
+        case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+            return strconv.FormatUint(v.Uint(), 10), true
+        case reflect.Float32, reflect.Float64:
+            return strconv.FormatFloat(v.Float(), 'f', -1, 64), true
+        }
+        return "", false
+    }
+
+    // stripeFlatten encodes nested parameters the way the Stripe API reads
+    // them: maps become ``key[sub]``, lists of scalars ``key[]`` (one value
+    // each, order kept), lists of maps ``key[0][sub]``, an empty list ``key=``
+    // (Stripe's "clear this list") and nil values are omitted.
+    func stripeFlatten(prefix string, value interface{}, out url.Values) {
+        if value == nil {
+            return
+        }
+        switch typed := value.(type) {
+        case LamJSON:
+            stripeFlatten(prefix, lamJSONRaw(typed), out)
+            return
+        case *LamJSON:
+            if typed != nil {
+                stripeFlatten(prefix, lamJSONRaw(*typed), out)
+            }
+            return
+        }
+        v := stripeDeref(reflect.ValueOf(value))
+        if !v.IsValid() {
+            return
+        }
+        if text, ok := stripeScalar(v); ok {
+            if prefix != "" {
+                out.Add(prefix, text)
+            }
+            return
+        }
+        switch v.Kind() {
+        case reflect.Map:
+            names := make([]string, 0, v.Len())
+            byName := map[string]reflect.Value{}
+            for _, key := range v.MapKeys() {
+                name := fmt.Sprint(key.Interface())
+                names = append(names, name)
+                byName[name] = key
+            }
+            sort.Strings(names)
+            for _, name := range names {
+                child := name
+                if prefix != "" {
+                    child = prefix + "[" + name + "]"
+                }
+                stripeFlatten(child, v.MapIndex(byName[name]).Interface(), out)
+            }
+        case reflect.Slice, reflect.Array:
+            if prefix == "" {
+                return
+            }
+            if v.Len() == 0 {
+                out.Add(prefix, "")
+                return
+            }
+            scalars := true
+            for i := 0; i < v.Len(); i++ {
+                if _, ok := stripeScalar(stripeDeref(v.Index(i))); !ok {
+                    scalars = false
+                    break
+                }
+            }
+            for i := 0; i < v.Len(); i++ {
+                if scalars {
+                    text, _ := stripeScalar(stripeDeref(v.Index(i)))
+                    out.Add(prefix+"[]", text)
+                } else {
+                    stripeFlatten(fmt.Sprintf("%s[%d]", prefix, i), v.Index(i).Interface(), out)
+                }
+            }
+        default:
+            if prefix != "" {
+                out.Add(prefix, fmt.Sprint(value))
+            }
+        }
+    }
+}
+
+const StripeLibraryVersion: str = "1.0.0"
+
+#- Static helpers: form encoding, validation and retry policy. -#
+class Stripe {
+    static func version() -> str {
+        return StripeLibraryVersion
+    }
+
+    static func userAgent() -> str {
+        return f"lam-stripe/{StripeLibraryVersion} (Lammergeier; +https://github.com/thallium-solutions/lam-stripe)"
+    }
+
+    #- URL-encodes flat form fields (keys used verbatim, sorted). -#
+    static func encodeForm(fields: dict[str, str]) -> str {
+        go! {
+            vals := url.Values{}
+            for k, v := range fields {
+                vals.Set(k, v)
+            }
+            return vals.Encode()
+        }
+    }
+
+    #- URL-encodes nested parameters: ``{"metadata": {"k": "v"}}`` becomes
+       ``metadata[k]=v``, ``{"items": [{"price": "p"}]}`` becomes
+       ``items[0][price]=p`` and ``{"expand": ["customer"]}`` becomes
+       ``expand[]=customer``. Booleans are ``true``/``false``, numbers are
+       decimal, ``None`` values are skipped, ``json`` values are walked like
+       dicts and lists, and flat keys such as ``"line_items[0][price]"``
+       are kept verbatim. -#
+    static func encodeParams(params: dict[str, any]) -> str {
+        go! {
+            vals := url.Values{}
+            stripeFlatten("", params, vals)
+            return vals.Encode()
+        }
+    }
+
+    #- Decodes a form body or query string (for mock servers and tests).
+       Malformed input yields the pairs that could be read. -#
+    static func decodeForm(body: str) -> dict[str, list[str]] {
+        out: dict[str, list[str]] = {}
+        go! {
+            parsed, _ := url.ParseQuery(body)
+            for k, v := range parsed {
+                out[k] = v
+            }
+        }
+        return out
+    }
+
+    #- First value of ``key`` in a form body or query string, or "". -#
+    static func formValue(body: str, key: str) -> str {
+        values: dict[str, list[str]] = Stripe.decodeForm(body)
+        if key in values and len(values[key]) > 0 {
+            return values[key][0]
+        }
+        return ""
+    }
+
+    static func errorMessage(res: StripeResponse) -> str {
+        if res.transportError != "" {
+            return res.transportError
+        }
+        if res.body != "" {
+            return res.body
+        }
+        return "stripe request failed with status " + str(res.status)
+    }
+
+    static func normalizeCurrency(currency: str) -> str {
+        return currency.trim().toLower()
+    }
+
+    static func addMetadata(fields: dict[str, str], metadata: dict[str, str]) {
+        for k, v in metadata {
+            fields["metadata[" + k + "]"] = v
+        }
+    }
+
+    static func validateAmount(amount: int) -> Result[bool] {
+        if amount <= 0 {
+            return Result.Err(StripeError.validation("amount must be greater than zero", "amount"))
+        }
+        return Result.Ok(true)
+    }
+
+    static func validateCurrency(currency: str) -> Result[bool] {
+        normalized: str = Stripe.normalizeCurrency(currency)
+        validLetters: bool = false
+        go! {
+            validLetters = len(normalized) == 3
+            for _, char := range normalized {
+                if char < 'a' || char > 'z' {
+                    validLetters = false
+                }
+            }
+        }
+        if not validLetters {
+            return Result.Err(StripeError.validation("currency must be a 3-letter ISO code", "currency"))
+        }
+        return Result.Ok(true)
+    }
+
+    #- Escapes an object id for use as one URL path segment. -#
+    static func escapeId(id: str) -> str {
+        go! {
+            return url.PathEscape(id)
+        }
+    }
+
+    #- Whether a failed attempt should be retried: ``Stripe-Should-Retry``
+       wins when present; otherwise transport failures (status 0), 409
+       (lock timeouts), 429 and 5xx are retried. -#
+    static func shouldRetry(status: int, shouldRetryHeader: str = "") -> bool {
+        header: str = shouldRetryHeader.trim().toLower()
+        if header == "true" {
+            return true
+        }
+        if header == "false" {
+            return false
+        }
+        return status == 0 or status == 409 or status == 429 or status >= 500
+    }
+
+    #- Delay before retry number ``attempt`` (1-based): exponential backoff
+       ``baseMs * 2^(attempt-1)`` capped at ``maxMs``, scaled into
+       ``[50%, 100%]`` by ``jitter`` (0..1). A ``Retry-After`` value (seconds)
+       raises the delay, still capped at ``maxMs``. -#
+    static func retryDelayMs(attempt: int, baseMs: int, maxMs: int, retryAfterSeconds: int = 0, jitter: float = 1.0) -> int {
+        delay: int = baseMs
+        step: int = 1
+        while step < attempt and delay < maxMs {
+            delay = delay * 2
+            step += 1
+        }
+        if delay > maxMs {
+            delay = maxMs
+        }
+        fraction: float = jitter
+        if fraction < 0.0 {
+            fraction = 0.0
+        }
+        if fraction > 1.0 {
+            fraction = 1.0
+        }
+        half: int = delay // 2
+        delay = half + int(float(delay - half) * fraction)
+        if retryAfterSeconds > 0 {
+            wanted: int = retryAfterSeconds * 1000
+            if wanted > maxMs {
+                wanted = maxMs
+            }
+            if wanted > delay {
+                delay = wanted
+            }
+        }
+        if delay < 0 {
+            delay = 0
+        }
+        return delay
+    }
+}

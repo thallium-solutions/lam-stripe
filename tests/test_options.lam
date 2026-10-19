@@ -1,0 +1,174 @@
+# expect: description=VIP&email=ada%2Bco%40example.com&metadata%5Btenant_id%5D=t-1&name=Ada+%26+Co&phone=%2B39
+# expect: usd true ord_123 manual
+# expect: StripeValidationError amount
+# expect: StripeValidationError currency
+# expect: true
+# expect: cancel_url=https://x.test/c&client_reference_id=t-1&customer=cus_1&line_items[0][price]=price_base&line_items[0][quantity]=1&line_items[1][price]=price_storage&line_items[2][price]=price_egress&metadata[plan]=pro&metadata[tenant_id]=t-1&mode=subscription&subscription_data[metadata][plan]=pro&subscription_data[metadata][tenant_id]=t-1&subscription_data[trial_period_days]=14&success_url=https://x.test/s
+# expect: 3
+# expect: line_items mode customer success_url line_items
+# expect: true
+# expect: billing_scheme=tiered&currency=eur&lookup_key=mft_pro_storage_1a2b&metadata[mft]=1&nickname=Pro storage&product=prod_1&recurring[interval]=month&recurring[meter]=mtr_1&recurring[usage_type]=metered&tiers[0][unit_amount_decimal]=0&tiers[0][up_to]=1000&tiers[1][unit_amount_decimal]=0.25&tiers[1][up_to]=5000&tiers[2][flat_amount_decimal]=100&tiers[2][unit_amount_decimal]=0.1&tiers[2][up_to]=inf&tiers_mode=graduated&transfer_lookup_key=true
+# expect: currency=eur&nickname=Pro monthly&product=prod_1&recurring[interval]=month&unit_amount=4900
+# expect: unit_amount tiers_mode tiers tiers tiers recurring product unit_amount
+# expect: items[0][id]=si_1&items[0][price]=price_new&items[1][deleted]=true&items[1][id]=si_2&items[2][price]=price_api&items[3][price]=price_seat&items[3][quantity]=5&metadata[plan]=team&proration_behavior=always_invoice
+# expect: 4 items items
+# expect: cancel_at_period_end=true&proration_behavior=none
+# expect: customer_mapping[event_payload_key]=stripe_customer_id&customer_mapping[type]=by_id&default_aggregation[formula]=sum&display_name=Storage (GiB-hours)&event_name=mft_storage&value_settings[event_payload_key]=value
+# expect: customer_mapping[event_payload_key]=cust&customer_mapping[type]=by_id&default_aggregation[formula]=count&display_name=API&event_name=api&event_time_window=hour
+# expect: display_name event_name default_aggregation
+# expect: event_name=mft_egress&identifier=t-1:egress:1700000000:42&payload[region]=eu&payload[stripe_customer_id]=cus_1&payload[value]=42&timestamp=1700000500
+# expect: event_name payload payload identifier
+# expect: active=false&description=Metered storage&metadata[mft_key]=storage&name=Storage&unit_label=GiB-hour
+# expect: name
+# expect: k1 acct_1 3 customer,data.price v
+from @lam/stripe import Stripe, StripeCustomerOptions, StripePaymentIntentOptions, StripeCheckoutSessionOptions, StripePriceOptions, StripeSubscriptionUpdate, StripeMeterOptions, StripeMeterEventOptions, StripeProductOptions, StripeRequestOptions
+from lamerrors import Result
+
+func readable(fields: dict[str, str]) -> str {
+    out: str = ""
+    raw: str = Stripe.encodeForm(fields)
+    go! {
+        import "net/url"
+        out, _ = url.QueryUnescape(raw)
+    }
+    return out
+}
+
+func param(r: Result[bool]) -> str {
+    if r.ok() {
+        return "ok"
+    }
+    se: any = r.error
+    out: str = ""
+    go! {
+        out = se.(*StripeError).Param
+    }
+    return out
+}
+
+func main() {
+    customer: StripeCustomerOptions = StripeCustomerOptions("ada+co@example.com", "Ada & Co")
+    customer.phone = "+39"
+    customer.description = "VIP"
+    customer.setMetadata("tenant_id", "t-1")
+    print(Stripe.encodeForm(customer.fields()))
+
+    intent: StripePaymentIntentOptions = StripePaymentIntentOptions(1299, " USD ")
+    intent.captureMethod = "manual"
+    intent.setMetadata("order_id", "ord_123")
+    f: dict[str, str] = intent.fields()
+    print(f["currency"], f["automatic_payment_methods[enabled]"], f["metadata[order_id]"], f["capture_method"])
+    zero: Result[bool] = StripePaymentIntentOptions(0, "usd").validate()
+    print(zero.error.kind, param(zero))
+    badCurrency: Result[bool] = StripePaymentIntentOptions(5, "1$!").validate()
+    print(badCurrency.error.kind, param(badCurrency))
+    print(intent.validate().ok())
+
+    # Subscription checkout: a licensed base price plus metered prices
+    # without quantity, linked to an existing customer.
+    checkout: StripeCheckoutSessionOptions = StripeCheckoutSessionOptions("https://x.test/s", "https://x.test/c", "price_base", 1)
+    checkout.mode = "subscription"
+    checkout.customerId = "cus_1"
+    checkout.clientReferenceId = "t-1"
+    checkout.trialPeriodDays = 14
+    checkout.setMetadata("tenant_id", "t-1")
+    checkout.setMetadata("plan", "pro")
+    checkout.setSubscriptionMetadata("tenant_id", "t-1").setSubscriptionMetadata("plan", "pro")
+    checkout.addLineItem("price_storage", 0).addLineItem("price_egress", 0)
+    print(readable(checkout.fields()))
+    print(checkout.lineItemCount())
+
+    noItems: StripeCheckoutSessionOptions = StripeCheckoutSessionOptions("https://x.test/s", "https://x.test/c")
+    badMode: StripeCheckoutSessionOptions = StripeCheckoutSessionOptions("https://x.test/s", "https://x.test/c", "p")
+    badMode.mode = "rent"
+    both: StripeCheckoutSessionOptions = StripeCheckoutSessionOptions("https://x.test/s", "https://x.test/c", "p")
+    both.customerId = "cus_1"
+    both.customerEmail = "a@b.c"
+    noSuccess: StripeCheckoutSessionOptions = StripeCheckoutSessionOptions(" ", "https://x.test/c", "p")
+    emptyLine: StripeCheckoutSessionOptions = StripeCheckoutSessionOptions("https://x.test/s", "https://x.test/c", "p")
+    emptyLine.addLineItem(" ")
+    print(param(noItems.validate()), param(badMode.validate()), param(both.validate()), param(noSuccess.validate()), param(emptyLine.validate()))
+
+    # Graduated metered price: free allowance, then two paid tiers.
+    tiered: StripePriceOptions = StripePriceOptions("EUR", "prod_1")
+    tiered.nickname = "Pro storage"
+    tiered.lookupKey = "mft_pro_storage_1a2b"
+    tiered.transferLookupKey = true
+    tiered.tiersMode = "graduated"
+    tiered.recurring("month", "metered", "mtr_1").setMetadata("mft", "1")
+    tiered.addTier(1000, "0").addTier(5000, "0.25").addTier(0, "0.1", "100")
+    print(tiered.validate().ok() and tiered.tierCount() == 3)
+    print(readable(tiered.fields()))
+
+    flat: StripePriceOptions = StripePriceOptions("eur", "prod_1")
+    flat.unitAmount = 4900
+    flat.nickname = "Pro monthly"
+    flat.recurring("month", "")
+    print(readable(flat.fields()))
+
+    noAmount: StripePriceOptions = StripePriceOptions("eur", "prod_1")
+    badTiersMode: StripePriceOptions = StripePriceOptions("eur", "prod_1")
+    badTiersMode.addTier(0, "1")
+    openMiddle: StripePriceOptions = StripePriceOptions("eur", "prod_1")
+    openMiddle.tiersMode = "volume"
+    openMiddle.addTier(0, "1").addTier(0, "2")
+    closedLast: StripePriceOptions = StripePriceOptions("eur", "prod_1")
+    closedLast.tiersMode = "volume"
+    closedLast.addTier(10, "1").addTier(20, "2")
+    decreasing: StripePriceOptions = StripePriceOptions("eur", "prod_1")
+    decreasing.tiersMode = "graduated"
+    decreasing.addTier(10, "1").addTier(5, "2").addTier(0, "3")
+    meteredOneOff: StripePriceOptions = StripePriceOptions("eur", "prod_1")
+    meteredOneOff.unitAmount = 1
+    meteredOneOff.usageType = "metered"
+    noProduct: StripePriceOptions = StripePriceOptions("eur", " ")
+    both2: StripePriceOptions = StripePriceOptions("eur", "prod_1")
+    both2.unitAmount = 5
+    both2.tiersMode = "graduated"
+    both2.addTier(0, "1")
+    print(param(noAmount.validate()), param(badTiersMode.validate()), param(openMiddle.validate()), param(closedLast.validate()), param(decreasing.validate()), param(meteredOneOff.validate()), param(noProduct.validate()), param(both2.validate()))
+
+    # Plan change: swap one item, delete one, add a metered and a seat item.
+    update: StripeSubscriptionUpdate = StripeSubscriptionUpdate("always_invoice")
+    update.updateItem("si_1", "price_new").deleteItem("si_2").addItem("price_api").addItem("price_seat", 5).setMetadata("plan", "team")
+    print(readable(update.fields()))
+    badDelete: StripeSubscriptionUpdate = StripeSubscriptionUpdate()
+    badDelete.deleteItem("")
+    badAdd: StripeSubscriptionUpdate = StripeSubscriptionUpdate()
+    badAdd.addItem("")
+    print(update.itemCount(), param(badDelete.validate()), param(badAdd.validate()))
+    cancel: StripeSubscriptionUpdate = StripeSubscriptionUpdate("none")
+    cancel.cancelAtPeriodEnd = "true"
+    print(readable(cancel.fields()))
+
+    meter: StripeMeterOptions = StripeMeterOptions("Storage (GiB-hours)", "mft_storage")
+    print(readable(meter.fields()))
+    counted: StripeMeterOptions = StripeMeterOptions("API", "api")
+    counted.aggregation = "count"
+    counted.customerPayloadKey = "cust"
+    counted.eventTimeWindow = "hour"
+    print(readable(counted.fields()))
+    badAgg: StripeMeterOptions = StripeMeterOptions("x", "y")
+    badAgg.aggregation = "avg"
+    print(param(StripeMeterOptions(" ", "e").validate()), param(StripeMeterOptions("d", "").validate()), param(badAgg.validate()))
+
+    usage: StripeMeterEventOptions = StripeMeterEventOptions("mft_egress", "cus_1", 42)
+    usage.identifier = "t-1:egress:1700000000:42"
+    usage.timestamp = 1700000500
+    usage.setPayload("region", "eu")
+    print(readable(usage.fields()))
+    longId: StripeMeterEventOptions = StripeMeterEventOptions("e", "cus_1", 1)
+    longId.identifier = "x".repeat(101)
+    print(param(StripeMeterEventOptions("", "c", 1).validate()), param(StripeMeterEventOptions("e", "", 1).validate()), param(StripeMeterEventOptions("e", "c", -1).validate()), param(longId.validate()))
+
+    product: StripeProductOptions = StripeProductOptions("Storage")
+    product.description = "Metered storage"
+    product.unitLabel = "GiB-hour"
+    product.active = false
+    product.setMetadata("mft_key", "storage")
+    print(readable(product.fields()))
+    print(param(StripeProductOptions("").validate()))
+
+    req: StripeRequestOptions = StripeRequestOptions("k1").account("acct_1").retries(3).expandField("customer").expandField("data.price").header("X-Test", "v")
+    print(req.idempotencyKey, req.stripeAccount, req.maxRetries, ",".join(req.expand), req.headers["X-Test"])
+}

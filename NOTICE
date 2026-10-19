@@ -1,0 +1,14 @@
+@lam/stripe
+
+Copyright 2026 Thallium Solutions di Busconi Alessandro.
+
+This product includes software developed by Thallium Solutions di Busconi
+Alessandro.
+
+@lam/stripe is a Lammergeier library for the Stripe REST API. It has no
+third-party dependencies: it is built on the Lammergeier standard library and
+the Go standard library only.
+
+Stripe is a trademark of Stripe, Inc. @lam/stripe is an unofficial,
+community-maintained client. It is not developed, endorsed, sponsored or
+supported by Stripe, Inc.

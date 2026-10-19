@@ -1,0 +1,77 @@
+# expect: a=1&space=hello+world&sym=a%2Bb%26c
+# expect: metadata[order key]=A&B + C
+# expect: email=ada+lab@example.com
+# expect: unicode=snowman ☃/line
+# expect: 2
+# expect: amount=2599&automatic_tax[enabled]=true&currency=eur&expand[]=customer&expand[]=invoice.subscription&items[0][price]=price_base&items[0][quantity]=1&items[1][price]=price_metered&metadata[plan]=pro&metadata[tenant_id]=t-1
+# expect: items=
+# expect: ratio=0.25
+# expect: line_items[0][price]=p&line_items[0][quantity]=2
+# expect: child[a][b][c]=deep
+# expect: json[list][0][x]=1&json[list][1][x]=2&json[n]=5
+# expect: true
+# expect: 
+# expect: 2
+# expect: cus%2F..%2Fx
+# expect: true
+
+from @lam/stripe import Stripe
+
+func decoded(text: str) -> str {
+    out: str = ""
+    go! {
+        import "net/url"
+        if s, err := url.QueryUnescape(text); err == nil {
+            out = s
+        }
+    }
+    return out
+}
+
+func main() {
+    # Flat fields: the 0.x contract, sorted and URL-encoded.
+    fields: dict[str, str] = {}
+    fields["space"] = "hello world"
+    fields["a"] = "1"
+    fields["sym"] = "a+b&c"
+    print(Stripe.encodeForm(fields))
+
+    edge: dict[str, str] = {"metadata[order key]": "A&B + C", "email": "ada+lab@example.com", "unicode": "snowman ☃/line\n2"}
+    form: dict[str, list[str]] = Stripe.decodeForm(Stripe.encodeForm(edge))
+    print("metadata[order key]=" + form["metadata[order key]"][0])
+    print("email=" + Stripe.formValue(Stripe.encodeForm(edge), "email"))
+    print("unicode=" + form["unicode"][0].split("\n")[0])
+    print(len(form["unicode"][0].split("\n")))
+
+    # Nested parameters: dicts, lists of dicts, scalar lists, ints, bools.
+    params: dict[str, any] = {
+        "amount": 2599,
+        "currency": "eur",
+        "automatic_tax": {"enabled": true},
+        "metadata": {"tenant_id": "t-1", "plan": "pro"},
+        "items": [{"price": "price_base", "quantity": 1}, {"price": "price_metered"}],
+        "expand": ["customer", "invoice.subscription"],
+        "skipped": None
+    }
+    print(decoded(Stripe.encodeParams(params)))
+
+    # An empty list clears a Stripe list field; floats keep their decimals.
+    print(decoded(Stripe.encodeParams({"items": []})))
+    print(decoded(Stripe.encodeParams({"ratio": 0.25})))
+    # Flat bracket keys stay verbatim.
+    print(decoded(Stripe.encodeParams({"line_items[0][price]": "p", "line_items[0][quantity]": 2})))
+    print(decoded(Stripe.encodeParams({"child": {"a": {"b": {"c": "deep"}}}})))
+    # Native json values are walked like dicts and lists.
+    doc: json = {"list": [{"x": 1}, {"x": 2}], "n": 5}
+    print(decoded(Stripe.encodeParams({"json": doc})))
+
+    # Repeated keys (lookup_keys[]) survive decoding.
+    repeated: dict[str, list[str]] = Stripe.decodeForm("lookup_keys%5B%5D=a&lookup_keys%5B%5D=b")
+    print(",".join(repeated["lookup_keys[]"]) == "a,b")
+    print(Stripe.formValue("a=1", "missing"))
+    print(len(Stripe.decodeForm("x=1&y=%zz&z=3")))
+
+    # Ids are escaped as one path segment.
+    print(Stripe.escapeId("cus/../x"))
+    print(Stripe.encodeParams({}) == "")
+}

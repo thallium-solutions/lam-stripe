@@ -1,0 +1,67 @@
+# expect: sub_1 subscription
+# expect: price_base 2 true 1700000000
+# expect: cus_9
+# expect: cus_9
+# expect: 0  false 0 true
+# expect: t-1 a.b
+# expect: price_base,price_meter
+# expect: true
+# expect: 200 req_7 2 lam-key
+# expect: {}
+# expect: 3 true cus_c cus_a cus_c
+# expect: cus_a,cus_b,cus_c
+# expect: 0 true
+# expect: evt_1 customer.subscription.updated 1700000100 false 2024-06-20 acct_1 req_9 ik_1
+# expect: sub_1 subscription past_due true
+# expect: true true false true
+# expect: true false
+# expect: StripeValidationError StripeValidationError
+# expect: pi_123 secret_123 https://x.test
+
+from @lam/stripe import StripeObject, StripeResponse, StripeList, StripeEvent
+from lamerrors import Result
+from lamjson import Json
+
+func main() {
+    body: str = """{"id":"sub_1","object":"subscription","status":"past_due","created":1700000000,"cancel_at_period_end":true,
+      "customer":{"id":"cus_9","object":"customer"},"metadata":{"tenant_id":"t-1","a.b":"dotted"},
+      "items":{"object":"list","data":[{"id":"si_1","price":{"id":"price_base","lookup_key":"base"}},{"id":"si_2","price":{"id":"price_meter"}}]}}"""
+    sub: StripeResponse = StripeResponse(200, body, "", {"Request-Id": ["req_7"]})
+    print(sub.id(), sub.objectType())
+    print(sub.getStr("items.data.0.price.id"), sub.getLen("items.data"), sub.getBool("cancel_at_period_end"), sub.getInt("created"))
+    # An expanded object read as text yields its id.
+    print(sub.getStr("customer"))
+    print(sub.getObject("customer").id())
+    # Missing paths are null-safe.
+    print(sub.getInt("nope.deeper"), sub.getStr("items.data.9.id"), sub.has("nope"), sub.getLen("nope"), sub.has("items.data.1"))
+    print(sub.metadata("tenant_id"), "a.b" if sub.metadata("a.b") == "dotted" else "?")
+    print(",".join([item.getStr("price.id") for item in sub.getList("items.data")]))
+    print(sub.ok())
+    sub.idempotencyKey = "lam-key"
+    sub.attempts = 2
+    print(sub.status, sub.requestId, sub.attempts, sub.idempotencyKey)
+    print(StripeResponse(200, "not json").json())
+
+    page: StripeList = StripeList(StripeResponse(200, "{\"object\":\"list\",\"has_more\":true,\"url\":\"/v1/customers\",\"data\":[{\"id\":\"cus_a\"},{\"id\":\"cus_b\"},{\"id\":\"cus_c\"}]}"))
+    print(page.size(), page.hasMore, page.lastId(), page.firstId(), page.data[2].id())
+    print(",".join(page.ids()))
+    emptyPage: StripeList = StripeList(StripeResponse(200, "{\"object\":\"list\",\"data\":[]}"))
+    print(emptyPage.size(), emptyPage.isEmpty() and emptyPage.first().id() == "" and emptyPage.lastId() == "")
+
+    raw: str = """{"id":"evt_1","object":"event","type":"customer.subscription.updated","created":1700000100,"livemode":false,
+      "api_version":"2024-06-20","account":"acct_1","request":{"id":"req_9","idempotency_key":"ik_1"},
+      "data":{"object":""" + body + ""","previous_attributes":{"status":"active"}}}"""
+    parsed: Result[StripeEvent] = StripeEvent.parse(raw)
+    event: StripeEvent = parsed.unwrap()
+    print(event.id, event.type, event.created, event.livemode, event.apiVersion, event.account, event.requestId, event.requestIdempotencyKey)
+    print(event.objectId(), event.objectType(), event.objectStr("status"), event.objectBool("cancel_at_period_end"))
+    print(event.isType("customer.subscription.updated"), event.isType("customer.subscription.*"), event.isType("invoice.*"), event.wasUpdated("status"))
+    print(event.object["items"]["data"][1]["id"] == "si_2", event.wasUpdated("metadata"))
+
+    bad: Result[StripeEvent] = StripeEvent.parse("{nope")
+    noType: Result[StripeEvent] = StripeEvent.parse("{\"id\":\"evt_2\"}")
+    print(bad.error.kind, noType.error.kind)
+
+    legacy: StripeResponse = StripeResponse(200, "{\"id\":\"pi_123\",\"client_secret\":\"secret_123\",\"url\":\"https://x.test\"}", "")
+    print(legacy.id(), legacy.clientSecret(), legacy.url())
+}

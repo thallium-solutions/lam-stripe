@@ -1,0 +1,610 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+
+from lamconv import Conv
+from lamerrors import Result
+from lamhttp import HttpClient, HttpRequestOptions, HttpResponse
+from lamrandom import Random
+from lamtime import Time
+from lamuuid import Uuid
+from .config import StripeConfig
+from .errors import StripeError
+from .models import StripeObject, StripeResponse, StripeList, StripeEvent
+from .options import StripeCustomerOptions, StripePaymentIntentOptions, StripeCheckoutSessionOptions, StripePriceOptions, StripeSubscriptionUpdate, StripeRequestOptions, StripeProductOptions, StripeMeterOptions, StripeMeterEventOptions
+from .util import Stripe
+
+#- Stripe REST client. Every call returns a typed ``Result``; failures are
+   ``StripeError`` values. Requests carry the configured ``Stripe-Version``
+   and ``Stripe-Account``, POSTs an ``Idempotency-Key``, and failed attempts
+   (network errors, 409, 429, 5xx, or ``Stripe-Should-Retry: true``) are
+   retried with exponential backoff and jitter. -#
+class StripeClient {
+    func init(self, cfg: StripeConfig) {
+        self.cfg: StripeConfig = cfg
+        self.http: HttpClient = HttpClient(cfg.baseUrl, cfg.timeoutMs)
+        #- Sticky ``Idempotency-Key`` set by ``setIdempotencyKey``. -#
+        self.idempotencyKey: str = ""
+        #- Requests sent by this client, retries included. -#
+        self.requestCount: int = 0
+        #- ``Request-Id`` of the last response ("" before the first one). -#
+        self.lastRequestId: str = ""
+    }
+
+    static func fromEnv() -> StripeClient {
+        return StripeClient(StripeConfig.fromEnv())
+    }
+
+    #- Uses ``key`` as the ``Idempotency-Key`` of every following POST until
+       ``clearIdempotencyKey`` (0.x behaviour). Prefer
+       ``StripeRequestOptions(key)`` for one request. -#
+    func setIdempotencyKey(self, key: str) {
+        self.idempotencyKey = key
+    }
+
+    func clearIdempotencyKey(self) {
+        self.idempotencyKey = ""
+    }
+
+    # ── request core ──────────────────────────────────────────────────
+
+    func _target(self, path: str, query: str) -> str {
+        if query == "" {
+            return path
+        }
+        if path.contains("?") {
+            return path + "&" + query
+        }
+        return path + "?" + query
+    }
+
+    func _clientUserAgent(self) -> str {
+        return "{\"bindings_version\":\"" + Stripe.version() + "\",\"lang\":\"lammergeier\",\"publisher\":\"thallium-solutions\",\"uname\":\"lam-stripe\"}"
+    }
+
+    #- Sends one API request. ``params`` are encoded like
+       ``Stripe.encodeParams`` (query string for GET/DELETE, form body for
+       POST); ``opts`` may be ``None``. -#
+    func request(self, method: str, path: str, params: dict[str, any] = {}, opts: StripeRequestOptions = None) -> Result[StripeResponse] {
+        options: StripeRequestOptions = opts
+        if options == None {
+            options = StripeRequestOptions()
+        }
+        verb: str = method.toUpper()
+        encoded: str = Stripe.encodeParams(params)
+        for field in options.expand {
+            expandPair: str = Stripe.encodeForm({"expand[]": field})
+            encoded = expandPair if encoded == "" else encoded + "&" + expandPair
+        }
+        return self._send(verb, path, encoded, options)
+    }
+
+    #- Sends a request whose form/query string is already encoded. -#
+    func _send(self, verb: str, path: str, encoded: str, options: StripeRequestOptions) -> Result[StripeResponse] {
+        _ = self.cfg.validate()?
+        target: str = path
+        body: str = ""
+        if verb == "POST" {
+            body = encoded
+        } else {
+            target = self._target(path, encoded)
+        }
+        headers: dict[str, str] = {}
+        headers["Authorization"] = "Bearer " + self.cfg.secretKey
+        agent: str = Stripe.userAgent()
+        if self.cfg.appInfo != "" {
+            agent = agent + " " + self.cfg.appInfo
+        }
+        headers["User-Agent"] = agent
+        headers["X-Stripe-Client-User-Agent"] = self._clientUserAgent()
+        headers["Accept"] = "application/json"
+        version: str = options.apiVersion if options.apiVersion != "" else self.cfg.apiVersion
+        if version != "" {
+            headers["Stripe-Version"] = version
+        }
+        account: str = options.stripeAccount if options.stripeAccount != "" else self.cfg.stripeAccount
+        if account != "" {
+            headers["Stripe-Account"] = account
+        }
+        maxRetries: int = options.maxRetries if options.maxRetries >= 0 else self.cfg.maxRetries
+        key: str = options.idempotencyKey if options.idempotencyKey != "" else self.idempotencyKey
+        if verb == "POST" {
+            if key == "" and self.cfg.autoIdempotencyKeys {
+                generated: Result[str] = Uuid.v4()
+                if generated.ok() {
+                    key = "lam-stripe-" + generated.unwrap()
+                }
+            }
+            if key != "" {
+                headers["Idempotency-Key"] = key
+            }
+        } else {
+            key = ""
+        }
+        for name, value in options.headers {
+            headers[name] = value
+        }
+        timeoutMs: int = options.timeoutMs if options.timeoutMs > 0 else self.cfg.timeoutMs
+        # A POST without an idempotency key is never retried: Stripe might
+        # have applied the first attempt.
+        canRetry: bool = verb != "POST" or key != ""
+
+        attempts: int = 0
+        while true {
+            attempts += 1
+            self.requestCount += 1
+            # Not named ``http``: see the README's compiler notes.
+            wire: HttpRequestOptions = HttpRequestOptions(timeoutMs)
+            for name, value in headers {
+                wire.header(name, value)
+            }
+            if verb == "POST" {
+                wire.text(body, "application/x-www-form-urlencoded")
+            }
+            sent: Result[HttpResponse] = self.http.request(verb, target, wire)
+            if not sent.ok() {
+                if canRetry and attempts <= maxRetries {
+                    Time.sleepMs(self._delay(attempts, 0))
+                    continue
+                }
+                failure: StripeError = StripeError.connection(verb, path, sent.error)
+                failure.attempts = attempts
+                failure.idempotencyKey = key
+                return Result.Err(failure)
+            }
+            res: HttpResponse = sent.unwrap()
+            requestId: str = res.header("Request-Id")
+            self.lastRequestId = requestId
+            if res.ok() {
+                out: StripeResponse = StripeResponse(res.status, res.body, "", res.headers)
+                out.idempotencyKey = key
+                out.attempts = attempts
+                return Result.Ok(out)
+            }
+            retryable: bool = Stripe.shouldRetry(res.status, res.header("Stripe-Should-Retry"))
+            if retryable and canRetry and attempts <= maxRetries {
+                retryAfter: Result[int] = Conv.parse(res.header("Retry-After").trim())
+                Time.sleepMs(self._delay(attempts, retryAfter.unwrapOr(0)))
+                continue
+            }
+            err: StripeError = StripeError.fromResponse(res.status, res.body, requestId)
+            err.attempts = attempts
+            err.idempotencyKey = key
+            err.retryable = retryable
+            return Result.Err(err)
+        }
+        return Result.Err(StripeError.config("unreachable"))
+    }
+
+    func _delay(self, attempt: int, retryAfterSeconds: int) -> int {
+        return Stripe.retryDelayMs(attempt, self.cfg.retryBaseDelayMs, self.cfg.retryMaxDelayMs, retryAfterSeconds, Random.randFloat())
+    }
+
+    # ── generic calls and escape hatches ──────────────────────────────
+
+    func get(self, path: str, params: dict[str, any] = {}, opts: StripeRequestOptions = None) -> Result[StripeResponse] {
+        return self.request("GET", path, params, opts)
+    }
+
+    func post(self, path: str, params: dict[str, any] = {}, opts: StripeRequestOptions = None) -> Result[StripeResponse] {
+        return self.request("POST", path, params, opts)
+    }
+
+    func delete(self, path: str, params: dict[str, any] = {}, opts: StripeRequestOptions = None) -> Result[StripeResponse] {
+        return self.request("DELETE", path, params, opts)
+    }
+
+    #- POSTs flat form fields used verbatim as keys
+       (``"metadata[plan]"``, ``"items[0][price]"``). -#
+    func postForm(self, path: str, fields: dict[str, str], opts: StripeRequestOptions = None) -> Result[StripeResponse] {
+        options: StripeRequestOptions = opts
+        if options == None {
+            options = StripeRequestOptions()
+        }
+        return self._send("POST", path, Stripe.encodeForm(fields), options)
+    }
+
+    #- GET of ``path`` exactly as given (query string included). -#
+    func rawGet(self, path: str) -> Result[StripeResponse] {
+        return self._send("GET", path, "", StripeRequestOptions())
+    }
+
+    func rawPostForm(self, path: str, fields: dict[str, str]) -> Result[StripeResponse] {
+        return self._send("POST", path, Stripe.encodeForm(fields), StripeRequestOptions())
+    }
+
+    func rawDelete(self, path: str) -> Result[StripeResponse] {
+        return self._send("DELETE", path, "", StripeRequestOptions())
+    }
+
+    # ── lists and pagination ──────────────────────────────────────────
+
+    #- One page of a list endpoint. -#
+    func list(self, path: str, params: dict[str, any] = {}, opts: StripeRequestOptions = None) -> Result[StripeList] {
+        res: StripeResponse = self.request("GET", path, params, opts)?
+        return Result.Ok(StripeList(res))
+    }
+
+    #- Iterator over every page of a list (``starting_after``) or search
+       (``page``) endpoint. -#
+    func pager(self, path: str, params: dict[str, any] = {}, opts: StripeRequestOptions = None) -> StripePager {
+        return StripePager(self, path, params, opts)
+    }
+
+    #- Every object of a list endpoint, following ``has_more`` (at most
+       ``maxItems`` objects when it is greater than zero). -#
+    func listAll(self, path: str, params: dict[str, any] = {}, maxItems: int = 0, opts: StripeRequestOptions = None) -> Result[list[StripeObject]] {
+        out: list[StripeObject] = []
+        pages: StripePager = StripePager(self, path, params, opts)
+        while pages.hasNext() {
+            page: StripeList = pages.next()?
+            for item in page.data {
+                if maxItems > 0 and len(out) >= maxItems {
+                    return Result.Ok(out)
+                }
+                out.append(item)
+            }
+        }
+        return Result.Ok(out)
+    }
+
+    func _id(self, kind: str, id: str) -> Result[str] {
+        if id.trim() == "" {
+            return Result.Err(StripeError.validation(f"{kind} id is required", "id"))
+        }
+        return Result.Ok(Stripe.escapeId(id.trim()))
+    }
+
+    func _expand(self, fields: list[str]) -> StripeRequestOptions {
+        options: StripeRequestOptions = StripeRequestOptions()
+        for field in fields {
+            options.expand.append(field)
+        }
+        return options
+    }
+
+    # ── customers ─────────────────────────────────────────────────────
+
+    func createCustomer(self, email: str, name: str = "") -> Result[StripeResponse] {
+        return self.createCustomerWithOptions(StripeCustomerOptions(email, name))
+    }
+
+    func createCustomerWithOptions(self, opts: StripeCustomerOptions, idempotencyKey: str = "") -> Result[StripeResponse] {
+        if opts.email.trim() == "" {
+            return Result.Err(StripeError.validation("customer email is required", "email"))
+        }
+        return self.postForm("/customers", opts.fields(), StripeRequestOptions(idempotencyKey))
+    }
+
+    func retrieveCustomer(self, id: str, expand: list[str] = []) -> Result[StripeResponse] {
+        safe: str = self._id("customer", id)?
+        return self.request("GET", "/customers/" + safe, {}, self._expand(expand))
+    }
+
+    #- Updates a customer with nested parameters
+       (``{"email": ..., "metadata": {"plan": "pro"}}``). -#
+    func updateCustomer(self, id: str, params: dict[str, any], idempotencyKey: str = "") -> Result[StripeResponse] {
+        safe: str = self._id("customer", id)?
+        return self.request("POST", "/customers/" + safe, params, StripeRequestOptions(idempotencyKey))
+    }
+
+    func deleteCustomer(self, id: str) -> Result[StripeResponse] {
+        safe: str = self._id("customer", id)?
+        return self.request("DELETE", "/customers/" + safe)
+    }
+
+    func listCustomers(self, params: dict[str, any] = {}) -> Result[StripeList] {
+        return self.list("/customers", params)
+    }
+
+    # ── payment intents ───────────────────────────────────────────────
+
+    func createPaymentIntent(self, amount: int, currency: str, description: str = "") -> Result[StripeResponse] {
+        opts: StripePaymentIntentOptions = StripePaymentIntentOptions(amount, currency)
+        opts.description = description
+        return self.createPaymentIntentWithOptions(opts)
+    }
+
+    func createPaymentIntentWithOptions(self, opts: StripePaymentIntentOptions, idempotencyKey: str = "") -> Result[StripeResponse] {
+        _ = opts.validate()?
+        return self.postForm("/payment_intents", opts.fields(), StripeRequestOptions(idempotencyKey))
+    }
+
+    func retrievePaymentIntent(self, id: str) -> Result[StripeResponse] {
+        safe: str = self._id("payment intent", id)?
+        return self.request("GET", "/payment_intents/" + safe)
+    }
+
+    # ── checkout and customer portal ──────────────────────────────────
+
+    func createCheckoutSession(self, successUrl: str, cancelUrl: str, mode: str = "payment", priceId: str = "", quantity: int = 1) -> Result[StripeResponse] {
+        opts: StripeCheckoutSessionOptions = StripeCheckoutSessionOptions(successUrl, cancelUrl, priceId, quantity)
+        opts.mode = mode
+        return self.createCheckoutSessionWithOptions(opts)
+    }
+
+    func createCheckoutSessionWithOptions(self, opts: StripeCheckoutSessionOptions, idempotencyKey: str = "") -> Result[StripeResponse] {
+        _ = opts.validate()?
+        return self.postForm("/checkout/sessions", opts.fields(), StripeRequestOptions(idempotencyKey))
+    }
+
+    func retrieveCheckoutSession(self, id: str, expand: list[str] = []) -> Result[StripeResponse] {
+        safe: str = self._id("checkout session", id)?
+        return self.request("GET", "/checkout/sessions/" + safe, {}, self._expand(expand))
+    }
+
+    #- Creates a customer portal session; the response ``url()`` is where
+       to redirect the customer. -#
+    func createPortalSession(self, customerId: str, returnUrl: str, configurationId: str = "", locale: str = "") -> Result[StripeResponse] {
+        if customerId.trim() == "" {
+            return Result.Err(StripeError.validation("customer id is required", "customer"))
+        }
+        fields: dict[str, str] = {}
+        fields["customer"] = customerId
+        if returnUrl != "" {
+            fields["return_url"] = returnUrl
+        }
+        if configurationId != "" {
+            fields["configuration"] = configurationId
+        }
+        if locale != "" {
+            fields["locale"] = locale
+        }
+        return self.postForm("/billing_portal/sessions", fields)
+    }
+
+    # ── products and prices ───────────────────────────────────────────
+
+    func createProduct(self, name: str, metadata: dict[str, str] = {}, idempotencyKey: str = "") -> Result[StripeResponse] {
+        opts: StripeProductOptions = StripeProductOptions(name)
+        for k, v in metadata {
+            opts.metadata[k] = v
+        }
+        return self.createProductWithOptions(opts, idempotencyKey)
+    }
+
+    func createProductWithOptions(self, opts: StripeProductOptions, idempotencyKey: str = "") -> Result[StripeResponse] {
+        _ = opts.validate()?
+        return self.postForm("/products", opts.fields(), StripeRequestOptions(idempotencyKey))
+    }
+
+    func retrieveProduct(self, id: str) -> Result[StripeResponse] {
+        safe: str = self._id("product", id)?
+        return self.request("GET", "/products/" + safe)
+    }
+
+    func createPrice(self, opts: StripePriceOptions, idempotencyKey: str = "") -> Result[StripeResponse] {
+        _ = opts.validate()?
+        return self.postForm("/prices", opts.fields(), StripeRequestOptions(idempotencyKey))
+    }
+
+    func retrievePrice(self, id: str, expand: list[str] = []) -> Result[StripeResponse] {
+        safe: str = self._id("price", id)?
+        return self.request("GET", "/prices/" + safe, {}, self._expand(expand))
+    }
+
+    #- Prices with the given lookup keys (``lookup_keys[]``, at most 10). -#
+    func listPricesByLookupKeys(self, lookupKeys: list[str], activeOnly: bool = true) -> Result[StripeList] {
+        if len(lookupKeys) == 0 or len(lookupKeys) > 10 {
+            return Result.Err(StripeError.validation("between 1 and 10 lookup keys are required", "lookup_keys"))
+        }
+        params: dict[str, any] = {}
+        params["lookup_keys"] = lookupKeys
+        params["limit"] = 100
+        if activeOnly {
+            params["active"] = true
+        }
+        return self.list("/prices", params)
+    }
+
+    #- The active price with ``lookupKey``, or ``None`` when there is none. -#
+    func findPriceByLookupKey(self, lookupKey: str) -> Result[StripeObject] {
+        page: StripeList = self.listPricesByLookupKeys([lookupKey])?
+        if page.isEmpty() {
+            return Result.Ok(None)
+        }
+        return Result.Ok(page.first())
+    }
+
+    # ── billing meters and meter events ───────────────────────────────
+
+    #- Every meter with ``status`` (``active``/``inactive``; "" for all),
+       all pages included. -#
+    func listMeters(self, status: str = "active") -> Result[list[StripeObject]] {
+        params: dict[str, any] = {}
+        params["limit"] = 100
+        if status != "" {
+            params["status"] = status
+        }
+        return self.listAll("/billing/meters", params)
+    }
+
+    #- The active meter whose ``event_name`` is ``eventName``, or ``None``. -#
+    func findMeterByEventName(self, eventName: str) -> Result[StripeObject] {
+        meters: list[StripeObject] = self.listMeters("active")?
+        for meter in meters {
+            if meter.getStr("event_name") == eventName {
+                return Result.Ok(meter)
+            }
+        }
+        return Result.Ok(None)
+    }
+
+    func createMeter(self, opts: StripeMeterOptions, idempotencyKey: str = "") -> Result[StripeResponse] {
+        _ = opts.validate()?
+        return self.postForm("/billing/meters", opts.fields(), StripeRequestOptions(idempotencyKey))
+    }
+
+    #- Reports usage to a meter. The identifier (when set) doubles as the
+       ``Idempotency-Key`` unless ``idempotencyKey`` is given. -#
+    func createMeterEventWithOptions(self, opts: StripeMeterEventOptions, idempotencyKey: str = "") -> Result[StripeResponse] {
+        _ = opts.validate()?
+        key: str = idempotencyKey if idempotencyKey != "" else opts.identifier
+        return self.postForm("/billing/meter_events", opts.fields(), StripeRequestOptions(key))
+    }
+
+    func createMeterEvent(self, eventName: str, customerId: str, value: int, identifier: str = "", timestamp: int = 0) -> Result[StripeResponse] {
+        opts: StripeMeterEventOptions = StripeMeterEventOptions(eventName, customerId, value)
+        opts.identifier = identifier
+        opts.timestamp = timestamp
+        return self.createMeterEventWithOptions(opts)
+    }
+
+    # ── subscriptions ─────────────────────────────────────────────────
+
+    func retrieveSubscription(self, id: str, expand: list[str] = []) -> Result[StripeResponse] {
+        safe: str = self._id("subscription", id)?
+        return self.request("GET", "/subscriptions/" + safe, {}, self._expand(expand))
+    }
+
+    func listSubscriptions(self, params: dict[str, any] = {}) -> Result[StripeList] {
+        return self.list("/subscriptions", params)
+    }
+
+    #- Applies a plan change (item swaps, additions, deletions) with the
+       update's proration behaviour. -#
+    func updateSubscription(self, id: str, update: StripeSubscriptionUpdate, idempotencyKey: str = "") -> Result[StripeResponse] {
+        safe: str = self._id("subscription", id)?
+        _ = update.validate()?
+        return self.postForm("/subscriptions/" + safe, update.fields(), StripeRequestOptions(idempotencyKey))
+    }
+
+    #- Cancels at the end of the current period (the customer keeps access
+       until then). -#
+    func cancelSubscriptionAtPeriodEnd(self, id: str) -> Result[StripeResponse] {
+        safe: str = self._id("subscription", id)?
+        return self.postForm("/subscriptions/" + safe, {"cancel_at_period_end": "true"})
+    }
+
+    #- Undoes ``cancelSubscriptionAtPeriodEnd`` before the period ends. -#
+    func reactivateSubscription(self, id: str) -> Result[StripeResponse] {
+        safe: str = self._id("subscription", id)?
+        return self.postForm("/subscriptions/" + safe, {"cancel_at_period_end": "false"})
+    }
+
+    #- Cancels immediately (``DELETE /v1/subscriptions/:id``); ``invoiceNow``
+       bills pending usage now and ``prorate`` credits unused time. -#
+    func cancelSubscription(self, id: str, invoiceNow: bool = false, prorate: bool = false) -> Result[StripeResponse] {
+        safe: str = self._id("subscription", id)?
+        params: dict[str, any] = {}
+        if invoiceNow {
+            params["invoice_now"] = true
+        }
+        if prorate {
+            params["prorate"] = true
+        }
+        return self.request("DELETE", "/subscriptions/" + safe, params)
+    }
+
+    #- Resumes a paused subscription (``POST /v1/subscriptions/:id/resume``).
+       ``billingCycleAnchor`` is ``now`` or ``unchanged`` ("" keeps Stripe's
+       default). -#
+    func resumeSubscription(self, id: str, prorationBehavior: str = "", billingCycleAnchor: str = "") -> Result[StripeResponse] {
+        safe: str = self._id("subscription", id)?
+        fields: dict[str, str] = {}
+        if prorationBehavior != "" {
+            fields["proration_behavior"] = prorationBehavior
+        }
+        if billingCycleAnchor != "" {
+            fields["billing_cycle_anchor"] = billingCycleAnchor
+        }
+        return self.postForm("/subscriptions/" + safe + "/resume", fields)
+    }
+
+    # ── invoices and events ───────────────────────────────────────────
+
+    #- One page of invoices, optionally for one customer / status. -#
+    func listInvoices(self, customerId: str = "", status: str = "", limit: int = 0) -> Result[StripeList] {
+        params: dict[str, any] = {}
+        if customerId != "" {
+            params["customer"] = customerId
+        }
+        if status != "" {
+            params["status"] = status
+        }
+        if limit > 0 {
+            params["limit"] = limit
+        }
+        return self.list("/invoices", params)
+    }
+
+    func retrieveInvoice(self, id: str, expand: list[str] = []) -> Result[StripeResponse] {
+        safe: str = self._id("invoice", id)?
+        return self.request("GET", "/invoices/" + safe, {}, self._expand(expand))
+    }
+
+    #- Fetches an event by id: the safe way to act on a webhook when the
+       payload itself should not be trusted beyond its id. -#
+    func retrieveEvent(self, id: str) -> Result[StripeEvent] {
+        safe: str = self._id("event", id)?
+        res: StripeResponse = self.request("GET", "/events/" + safe)?
+        return Result.Ok(StripeEvent(res.json()))
+    }
+
+    func listEvents(self, params: dict[str, any] = {}) -> Result[StripeList] {
+        return self.list("/events", params)
+    }
+
+    #- ``GET /v1/balance`` (a cheap credential check). -#
+    func retrieveBalance(self) -> Result[StripeResponse] {
+        return self.request("GET", "/balance")
+    }
+}
+
+#- Walks a list or search endpoint page by page::
+
+       pages: StripePager = client.pager("/customers", {"limit": 100})
+       while pages.hasNext() {
+           page: StripeList = pages.next()?
+           ...
+       }
+
+   List pages continue with ``starting_after`` (or ``ending_before`` when
+   the first request used it); search pages with ``page``. -#
+class StripePager {
+    func init(self, client: StripeClient, path: str, params: dict[str, any] = {}, opts: StripeRequestOptions = None) {
+        self.client: StripeClient = client
+        self.path: str = path
+        self.params: dict[str, any] = {}
+        for k, v in params {
+            self.params[k] = v
+        }
+        self.opts: StripeRequestOptions = opts
+        self.done: bool = false
+        #- Pages fetched so far. -#
+        self.pages: int = 0
+        self.backwards: bool = "ending_before" in params
+    }
+
+    func hasNext(self) -> bool {
+        return not self.done
+    }
+
+    func next(self) -> Result[StripeList] {
+        if self.done {
+            return Result.Err(StripeError.validation("no more pages", "starting_after"))
+        }
+        res: Result[StripeResponse] = self.client.request("GET", self.path, self.params, self.opts)
+        if not res.ok() {
+            self.done = true
+            return Result.Err(res.error)
+        }
+        page: StripeList = StripeList(res.unwrap())
+        self.pages += 1
+        if page.response.objectType() == "search_result" {
+            if page.hasMore and page.nextPage != "" {
+                self.params["page"] = page.nextPage
+            } else {
+                self.done = true
+            }
+            return Result.Ok(page)
+        }
+        if not page.hasMore or page.isEmpty() {
+            self.done = true
+        } elif self.backwards {
+            self.params["ending_before"] = page.firstId()
+        } else {
+            self.params["starting_after"] = page.lastId()
+        }
+        return Result.Ok(page)
+    }
+}

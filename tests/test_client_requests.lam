@@ -1,0 +1,148 @@
+# expect: StripeConfigError 0
+# expect: Bearer sk_test_requests
+# expect: true true true
+# expect: lam-stripe/1.0.0 (Lammergeier; +https://github.com/thallium-solutions/lam-stripe) billing-app/2.0
+# expect: 2024-06-20 acct_platform application/x-www-form-urlencoded
+# expect: lammergeier 1.0.0
+# expect: true
+# expect: [] true
+# expect: sticky-1 sticky-1
+# expect: once-2 sticky-1
+# expect: []
+# expect: 2025-03-31.basil acct_connected
+# expect: GET /v1/subscriptions/sub_1 expand[]=items.data.price&expand[]=customer
+# expect: DELETE /v1/subscriptions/sub_1 invoice_now=true&prorate=true
+# expect: GET /v1/charges?created[gte]=5&limit=3 created[gte]=5&limit=3
+# expect: POST /v1/refunds amount=599&metadata[order_id]=ord 42&payment_intent=pi_1
+# expect: DELETE /v1/customers/cus_1
+# expect: POST /v1/customers/cus_1 address[city]=Rome&email=new@example.com&metadata[plan]=pro&preferred_locales[]=it&preferred_locales[]=en
+# expect: GET /v1/customers/cus%2F1
+# expect: StripeValidationError id 0
+# expect: StripeCardError card_declined insufficient_funds req_mock_error 402 1
+# expect: StripeInvalidRequestError resource_missing 404
+# expect: StripeAuthenticationError
+# expect: true
+# expect: cus_ok 200 1
+from @lam/stripe import StripeClient, StripeConfig, StripeResponse, StripeRequestOptions, StripeError, Stripe
+from stripe_mock import StripeMock, MockRequest, MockReply
+from lamerrors import Result
+from lamjson import Json
+
+func handle(req: MockRequest) -> MockReply {
+    if req.path == "/v1/customers/cus_declined" {
+        reply: MockReply = MockReply.error(402, "card_error", "Your card has insufficient funds.", "card_declined")
+        reply.body = "{\"error\":{\"type\":\"card_error\",\"code\":\"card_declined\",\"decline_code\":\"insufficient_funds\",\"message\":\"Your card has insufficient funds.\"}}"
+        return reply
+    }
+    if req.path == "/v1/customers/cus_missing" {
+        return MockReply.error(404, "invalid_request_error", "No such customer", "resource_missing")
+    }
+    if req.header("Authorization") == "Bearer sk_test_revoked" {
+        return MockReply.error(401, "invalid_request_error", "Invalid API Key provided")
+    }
+    return MockReply.json("{\"id\":\"cus_ok\",\"object\":\"customer\"}")
+}
+
+func readable(text: str) -> str {
+    out: str = ""
+    go! {
+        import "net/url"
+        out, _ = url.QueryUnescape(text)
+    }
+    return out
+}
+
+func line(req: MockRequest) -> str {
+    return f"{req.method} {req.path} {readable(req.params())}".trim()
+}
+
+func failure(r: Result[StripeResponse]) -> StripeError {
+    return StripeError.of(r.error)
+}
+
+func main() {
+    mock: StripeMock = StripeMock.start(handle)
+
+    # No key: rejected before any request is sent.
+    unconfigured: StripeClient = StripeClient(StripeConfig("", mock.baseUrl))
+    print(unconfigured.rawGet("/balance").error.kind, mock.count())
+
+    cfg: StripeConfig = StripeConfig("sk_test_requests", mock.baseUrl, "2024-06-20", 5000, stripeAccount="acct_platform")
+    cfg.appInfo = "billing-app/2.0"
+    client: StripeClient = StripeClient(cfg)
+    created: StripeResponse = client.createCustomer("ada@example.com", "Ada").unwrap()
+    first: MockRequest = mock.last()
+    print(first.header("Authorization"))
+    ua: str = first.header("User-Agent")
+    print(ua.startsWith("lam-stripe/1.0.0"), not ua.contains("lamstripe/0.1.0"), created.idempotencyKey == first.header("Idempotency-Key"))
+    print(ua)
+    print(first.header("Stripe-Version"), first.header("Stripe-Account"), first.header("Content-Type"))
+    clientUa: json = Json.decode(first.header("X-Stripe-Client-User-Agent")).unwrap()
+    lang: str = clientUa.lang
+    bindings: str = clientUa.bindings_version
+    print(lang, bindings)
+    print(first.header("Idempotency-Key").startsWith("lam-stripe-") and len(first.header("Idempotency-Key")) == 47)
+
+    # GETs carry no idempotency key and no content type.
+    _ = client.retrieveCustomer("cus_1").unwrap()
+    print(f"[{mock.last().header('Idempotency-Key')}]", mock.last().header("Content-Type") == "")
+
+    # Sticky key (0.x setIdempotencyKey) and a per-request override.
+    client.setIdempotencyKey("sticky-1")
+    _ = client.rawPostForm("/customers", {"email": "a@b.c"}).unwrap()
+    stickyKey: str = mock.last().header("Idempotency-Key")
+    _ = client.rawPostForm("/customers", {"email": "a@b.c"}).unwrap()
+    print(stickyKey, mock.last().header("Idempotency-Key"))
+    _ = client.postForm("/customers", {"email": "a@b.c"}, StripeRequestOptions("once-2")).unwrap()
+    onceKey: str = mock.last().header("Idempotency-Key")
+    _ = client.rawPostForm("/customers", {"email": "a@b.c"}).unwrap()
+    print(onceKey, mock.last().header("Idempotency-Key"))
+    client.clearIdempotencyKey()
+    client.cfg.autoIdempotencyKeys = false
+    _ = client.rawPostForm("/customers", {"email": "a@b.c"}).unwrap()
+    print(f"[{mock.last().header('Idempotency-Key')}]")
+    client.cfg.autoIdempotencyKeys = true
+
+    # Per-request version and connected account.
+    override: StripeRequestOptions = StripeRequestOptions()
+    override.apiVersion = "2025-03-31.basil"
+    _ = client.get("/balance", {}, override.account("acct_connected")).unwrap()
+    print(mock.last().header("Stripe-Version"), mock.last().header("Stripe-Account"))
+
+    # expand[], DELETE params, raw paths and nested parameters.
+    _ = client.retrieveSubscription("sub_1", ["items.data.price", "customer"]).unwrap()
+    print(line(mock.last()))
+    _ = client.cancelSubscription("sub_1", invoiceNow=true, prorate=true).unwrap()
+    print(line(mock.last()))
+    _ = client.rawGet("/charges?limit=3&created[gte]=5").unwrap()
+    raw: MockRequest = mock.last()
+    print(f"{raw.method} {raw.path}?{readable(raw.query)} {readable(raw.query)}")
+    _ = client.post("/refunds", {"payment_intent": "pi_1", "amount": 599, "metadata": {"order_id": "ord 42"}}).unwrap()
+    print(line(mock.last()))
+    _ = client.deleteCustomer("cus_1").unwrap()
+    print(line(mock.last()))
+    _ = client.updateCustomer("cus_1", {"email": "new@example.com", "metadata": {"plan": "pro"}, "address": {"city": "Rome"}, "preferred_locales": ["it", "en"]}).unwrap()
+    print(line(mock.last()))
+    _ = client.retrieveCustomer("cus/1").unwrap()
+    escaped: MockRequest = mock.last()
+    # The mock sees the decoded path; the escaping itself is shown here.
+    print(f"GET /v1/customers/{Stripe.escapeId('cus/1')}" if escaped.path == "/v1/customers/cus/1" else line(escaped))
+
+    # Validation happens before sending.
+    before: int = mock.count()
+    invalid: Result[StripeResponse] = client.retrieveSubscription("  ")
+    print(invalid.error.kind, failure(invalid).param, mock.count() - before)
+
+    # Typed API errors.
+    declined: StripeError = failure(client.retrieveCustomer("cus_declined"))
+    print(declined.kind, declined.code, declined.declineCode, declined.requestId, declined.status, declined.attempts)
+    missing: StripeError = failure(client.retrieveCustomer("cus_missing"))
+    print(missing.kind, missing.code, missing.status)
+    revoked: StripeClient = StripeClient(StripeConfig("sk_test_revoked", mock.baseUrl))
+    print(revoked.retrieveBalance().error.kind)
+    print(client.lastRequestId == "req_mock_error")
+
+    ok: StripeResponse = client.retrieveCustomer("cus_ok").unwrap()
+    print(ok.id(), ok.status, ok.attempts)
+    mock.stop()
+}

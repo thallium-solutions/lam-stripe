@@ -1,0 +1,27 @@
+# expect: true
+# expect: true
+# expect: true
+# expect: true
+#
+# Live smoke test against the Stripe API in test mode. Runs only through
+# ``python3 tests/run_lamstripe_tests.py --live`` with LAMSTRIPE_LIVE_TESTS=1
+# and a test-mode STRIPE_SECRET_KEY; it only reads (no objects are created).
+from @lam/stripe import StripeClient, StripeConfig, StripeResponse, StripeList, StripeError
+from lamenv import Env
+from lamerrors import Result
+
+func main() {
+    cfg: StripeConfig = StripeConfig.fromEnv()
+    if Env.getOr("LAMSTRIPE_LIVE_TESTS", "") != "1" or not cfg.isTestMode() {
+        print("skip: set LAMSTRIPE_LIVE_TESTS=1 and a test-mode STRIPE_SECRET_KEY")
+        return
+    }
+    client: StripeClient = StripeClient(cfg)
+    balance: Result[StripeResponse] = client.retrieveBalance()
+    print(balance.ok() and balance.unwrap().objectType() == "balance")
+    customers: Result[StripeList] = client.listCustomers({"limit": 1})
+    print(customers.ok() and customers.unwrap().response.objectType() == "list")
+    missing: StripeError = StripeError.of(client.retrieveCustomer("cus_lam_stripe_does_not_exist").error)
+    print(missing.kind == "StripeInvalidRequestError" and missing.code == "resource_missing" and missing.requestId != "")
+    print(client.lastRequestId.startsWith("req_"))
+}

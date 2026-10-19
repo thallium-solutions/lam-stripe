@@ -1,0 +1,412 @@
+# expect: catalog meters=2 products=3 prices=3
+# expect: catalog-again meters=2 products=3 prices=3 posts=0
+# expect: price tiers graduated mtr_3 inf 0.25
+# expect: customer cus_1 t-42 pro@example.com
+# expect: customer-updated billing@example.com pro
+# expect: checkout https://checkout.stripe.test/cs_1 subscription t-42
+# expect: checkout-lines price_base:1,price_storage:-,price_egress:-
+# expect: portal https://billing.stripe.test/p/cus_1
+# expect: usage sent=150 duplicates=1 total=150 storage=100 egress=50
+# expect: usage-keys t-42:storage:1700000000:100 t-42:storage:1700000000:100
+# expect: plan-change items=si_1>price_team_base,si_2>price_team_storage,si_3>deleted,+price_team_api proration=create_prorations
+# expect: cancel-at-period-end true
+# expect: reactivate false
+# expect: resume active
+# expect: canceled canceled canceled invoice_now=true
+# expect: invoices 2 in_1,in_2 paid
+# expect: invoice in_2 4900 https://invoice.stripe.test/in_2
+# expect: webhook subscribed duplicate rejected:StripeSignatureError rotated:invoice-paid ignored
+# expect: event evt_3 invoice.paid in_2 true
+# expect: errors StripeInvalidRequestError:resource_missing:404 StripeValidationError:id
+# expect: requests 37
+from @lam/stripe import StripeClient, StripeConfig, StripeResponse, StripeList, StripeObject, StripeEvent, StripeError, StripeWebhook, Stripe, StripeMeterOptions, StripeMeterEventOptions, StripePriceOptions, StripeCheckoutSessionOptions, StripeCustomerOptions, StripeSubscriptionUpdate
+from stripe_mock import StripeMock, MockRequest, MockReply
+from lamerrors import Result
+
+# ── a small stateful fake of the Stripe Billing API ─────────────────────
+
+class Fake {
+    static seq: int = 0
+    static meters: dict[str, str] = {}
+    static prices: dict[str, str] = {}
+    static priceTiers: dict[str, int] = {}
+    static products: int = 0
+    static identifiers: list[str] = []
+    static usage: dict[str, int] = {}
+    static subscriptionStatus: str = "active"
+    static cancelAtPeriodEnd: bool = false
+    static events: dict[str, str] = {}
+}
+
+func nextId(prefix: str) -> str {
+    Fake.seq += 1
+    return f"{prefix}_{Fake.seq}"
+}
+
+func subscriptionBody() -> str {
+    flag: str = "true" if Fake.cancelAtPeriodEnd else "false"
+    items: list[str] = [
+        "{\"id\":\"si_1\",\"price\":{\"id\":\"price_base\",\"lookup_key\":\"pro_base\"}}",
+        "{\"id\":\"si_2\",\"price\":{\"id\":\"price_storage\",\"lookup_key\":\"pro_storage\"}}",
+        "{\"id\":\"si_3\",\"price\":{\"id\":\"price_egress\",\"lookup_key\":\"pro_egress\"}}"
+    ]
+    return f"{{\"id\":\"sub_1\",\"object\":\"subscription\",\"status\":\"{Fake.subscriptionStatus}\",\"cancel_at_period_end\":{flag},\"customer\":\"cus_1\",\"items\":{{\"object\":\"list\",\"data\":[" + ",".join(items) + "]}}"
+}
+
+func listOf(items: list[str]) -> str {
+    return "{\"object\":\"list\",\"has_more\":false,\"data\":[" + ",".join(items) + "]}"
+}
+
+func fakeStripe(req: MockRequest) -> MockReply {
+    form: dict[str, list[str]] = Stripe.decodeForm(req.params())
+    value = lambda (key: str) -> str: form[key][0] if key in form else ""
+    route: str = f"{req.method} {req.path.replaceFirst('/v1', '')}"
+    match route {
+        case "GET /billing/meters" {
+            return MockReply.json(listOf([f"{{\"id\":\"{id}\",\"event_name\":\"{name}\",\"status\":\"active\"}}" for name, id in Fake.meters]))
+        }
+        case "POST /billing/meters" {
+            id: str = nextId("mtr")
+            Fake.meters[value("event_name")] = id
+            return MockReply.json(f"{{\"id\":\"{id}\",\"object\":\"billing.meter\"}}")
+        }
+        case "POST /products" {
+            Fake.products += 1
+            return MockReply.json(f"{{\"id\":\"{nextId('prod')}\",\"metadata\":{{\"mft_key\":\"{value('metadata[mft_key]')}\"}}}}")
+        }
+        case "GET /prices" {
+            key: str = value("lookup_keys[]")
+            found: list[str] = [f"{{\"id\":\"{Fake.prices[key]}\",\"lookup_key\":\"{key}\"}}"] if key in Fake.prices else []
+            return MockReply.json(listOf(found))
+        }
+        case "POST /prices" {
+            id: str = nextId("price")
+            Fake.prices[value("lookup_key")] = id
+            tiers: int = len([k for k in form if k.startsWith("tiers[") and k.endsWith("[up_to]")])
+            Fake.priceTiers[id] = tiers
+            return MockReply.json(f"{{\"id\":\"{id}\",\"tiers_mode\":\"{value('tiers_mode')}\",\"recurring\":{{\"meter\":\"{value('recurring[meter]')}\"}},\"tiers\":[{{\"up_to\":\"{value('tiers[1][up_to]')}\",\"unit_amount_decimal\":\"{value('tiers[0][unit_amount_decimal]')}\"}},{{\"up_to\":\"{value('tiers[2][up_to]')}\",\"unit_amount_decimal\":\"{value('tiers[1][unit_amount_decimal]')}\"}}]}}")
+        }
+        case "POST /customers" {
+            return MockReply.json(f"{{\"id\":\"cus_1\",\"email\":\"{value('email')}\",\"metadata\":{{\"tenant_id\":\"{value('metadata[tenant_id]')}\"}}}}")
+        }
+        case "GET /customers/cus_1" {
+            return MockReply.json("{\"id\":\"cus_1\",\"email\":\"pro@example.com\",\"metadata\":{\"tenant_id\":\"t-42\"}}")
+        }
+        case "POST /customers/cus_1" {
+            return MockReply.json(f"{{\"id\":\"cus_1\",\"email\":\"{value('email')}\",\"metadata\":{{\"plan\":\"{value('metadata[plan]')}\"}}}}")
+        }
+        case "POST /checkout/sessions" {
+            return MockReply.json(f"{{\"id\":\"cs_1\",\"url\":\"https://checkout.stripe.test/cs_1\",\"mode\":\"{value('mode')}\",\"client_reference_id\":\"{value('client_reference_id')}\"}}")
+        }
+        case "POST /billing_portal/sessions" {
+            return MockReply.json(f"{{\"id\":\"bps_1\",\"url\":\"https://billing.stripe.test/p/{value('customer')}\"}}")
+        }
+        case "POST /billing/meter_events" {
+            identifier: str = value("identifier")
+            if identifier in Fake.identifiers {
+                return MockReply.error(400, "invalid_request_error", "duplicate meter event identifier", "meter_event_duplicate_identifier")
+            }
+            Fake.identifiers.append(identifier)
+            name: str = value("event_name")
+            Fake.usage[name] = (Fake.usage[name] if name in Fake.usage else 0) + int(value("payload[value]"))
+            return MockReply.json("{\"object\":\"billing.meter_event\",\"identifier\":\"" + identifier + "\"}")
+        }
+        case "GET /subscriptions/sub_1" {
+            return MockReply.json(subscriptionBody())
+        }
+        case "POST /subscriptions/sub_1" {
+            if "cancel_at_period_end" in form {
+                Fake.cancelAtPeriodEnd = value("cancel_at_period_end") == "true"
+            }
+            return MockReply.json(subscriptionBody())
+        }
+        case "POST /subscriptions/sub_1/resume" {
+            Fake.subscriptionStatus = "active"
+            return MockReply.json(subscriptionBody())
+        }
+        case "DELETE /subscriptions/sub_1" {
+            Fake.subscriptionStatus = "canceled"
+            return MockReply.json(subscriptionBody())
+        }
+        case "GET /invoices" {
+            return MockReply.json(listOf(["{\"id\":\"in_1\",\"status\":\"paid\"}", "{\"id\":\"in_2\",\"status\":\"open\"}"]))
+        }
+        case "GET /invoices/in_2" {
+            return MockReply.json("{\"id\":\"in_2\",\"amount_due\":4900,\"hosted_invoice_url\":\"https://invoice.stripe.test/in_2\"}")
+        }
+        case r if r.startsWith("GET /events/") {
+            id: str = req.path.split("/")[3]
+            if id in Fake.events {
+                return MockReply.json(Fake.events[id])
+            }
+            return MockReply.error(404, "invalid_request_error", "No such event", "resource_missing")
+        }
+        case _ {
+            return MockReply.error(404, "invalid_request_error", "unknown route " + route, "resource_missing")
+        }
+    }
+}
+
+# ── an application billing service built on @lam/stripe ────────────────
+
+class Charge {
+    func init(self, metric: str, label: str, tiers: list[int], prices: list[str]) {
+        self.metric: str = metric
+        self.label: str = label
+        self.tiers: list[int] = tiers
+        self.prices: list[str] = prices
+    }
+}
+
+class Billing {
+    func init(self, client: StripeClient, webhookSecrets: str) {
+        self.client: StripeClient = client
+        self.secrets: list[str] = StripeWebhook.splitSecrets(webhookSecrets)
+        self.catalog: dict[str, str] = {}
+        self.processed: list[str] = []
+        self.meters: int = 0
+        self.products: int = 0
+        self.prices: int = 0
+    }
+
+    func ensureMeter(self, eventName: str, displayName: str) -> Result[str] {
+        existing: StripeObject = self.client.findMeterByEventName(eventName)?
+        if existing != None {
+            return Result.Ok(existing.id())
+        }
+        created: StripeResponse = self.client.createMeter(StripeMeterOptions(displayName, eventName), f"meter-{eventName}")?
+        self.meters += 1
+        return Result.Ok(created.id())
+    }
+
+    func ensureProduct(self, key: str, name: str) -> Result[str] {
+        if f"product:{key}" in self.catalog {
+            return Result.Ok(self.catalog[f"product:{key}"])
+        }
+        created: StripeResponse = self.client.createProduct(name, {"mft_key": key}, f"product-{key}")?
+        self.products += 1
+        self.catalog[f"product:{key}"] = created.id()
+        return Result.Ok(created.id())
+    }
+
+    func ensurePrice(self, lookupKey: str, opts: StripePriceOptions) -> Result[StripeObject] {
+        found: StripeObject = self.client.findPriceByLookupKey(lookupKey)?
+        if found != None {
+            return Result.Ok(found)
+        }
+        opts.lookupKey = lookupKey
+        created: StripeResponse = self.client.createPrice(opts, f"price-{lookupKey}")?
+        self.prices += 1
+        return Result.Ok(created)
+    }
+
+    func syncCatalog(self, charges: list[Charge]) -> Result[dict[str, StripeObject]] {
+        out: dict[str, StripeObject] = {}
+        baseProduct: str = self.ensureProduct("plan-pro", "Pro plan")?
+        base: StripePriceOptions = StripePriceOptions("eur", baseProduct)
+        base.unitAmount = 4900
+        base.recurring("month", "licensed")
+        out["base"] = self.ensurePrice("pro_base", base)?
+        for charge in charges {
+            meter: str = self.ensureMeter(charge.metric, charge.label)?
+            product: str = self.ensureProduct(charge.metric, charge.label)?
+            opts: StripePriceOptions = StripePriceOptions("EUR", product)
+            opts.tiersMode = "graduated"
+            opts.recurring("month", "metered", meter)
+            for i in range(len(charge.tiers)) {
+                opts.addTier(charge.tiers[i], charge.prices[i])
+            }
+            out[charge.metric] = self.ensurePrice(f"pro_{charge.metric}", opts)?
+        }
+        return Result.Ok(out)
+    }
+
+    func checkout(self, tenantId: str, customerId: str, prices: list[str]) -> Result[str] {
+        opts: StripeCheckoutSessionOptions = StripeCheckoutSessionOptions("https://app.test/billing?ok=1", "https://app.test/billing")
+        opts.mode = "subscription"
+        opts.customerId = customerId
+        opts.clientReferenceId = tenantId
+        opts.setMetadata("tenant_id", tenantId)
+        opts.setSubscriptionMetadata("tenant_id", tenantId).setSubscriptionMetadata("plan", "pro")
+        for price in prices {
+            opts.addLineItem(price, 1 if price == "price_base" else 0)
+        }
+        session: StripeResponse = self.client.createCheckoutSessionWithOptions(opts)?
+        return Result.Ok(f"{session.url()} {session.getStr('mode')} {session.getStr('client_reference_id')}")
+    }
+
+    #- Reports the cumulative total of a metric as a delta with a stable
+       identifier, so a replay after a crash is counted once. -#
+    func report(self, tenantId: str, customerId: str, metric: str, periodStart: int, total: int, reported: int) -> Result[int] {
+        delta: int = total - reported
+        if delta <= 0 {
+            return Result.Ok(0)
+        }
+        usage: StripeMeterEventOptions = StripeMeterEventOptions(metric, customerId, delta)
+        usage.identifier = f"{tenantId}:{metric}:{periodStart}:{total}"
+        usage.timestamp = periodStart + 60
+        _ = self.client.createMeterEventWithOptions(usage)?
+        return Result.Ok(delta)
+    }
+
+    func changePlan(self, subscriptionId: str, mapping: dict[str, str], extra: list[str]) -> Result[StripeResponse] {
+        sub: StripeResponse = self.client.retrieveSubscription(subscriptionId, ["items.data.price"])?
+        update: StripeSubscriptionUpdate = StripeSubscriptionUpdate("create_prorations")
+        for item in sub.getList("items.data") {
+            role: str = item.getStr("price.lookup_key")
+            if role in mapping {
+                update.updateItem(item.id(), mapping[role])
+            } else {
+                update.deleteItem(item.id())
+            }
+        }
+        for price in extra {
+            update.addItem(price)
+        }
+        update.setMetadata("plan", "team")
+        return self.client.updateSubscription(subscriptionId, update, f"plan-{subscriptionId}-team")
+    }
+
+    #- A webhook endpoint: verify, deduplicate by event id, dispatch. -#
+    func handleWebhook(self, payload: str, header: str, nowUnix: int) -> Result[str] {
+        event: StripeEvent = StripeWebhook.verifyAny(payload, header, self.secrets, 300, nowUnix)?
+        if event.id in self.processed {
+            return Result.Ok("duplicate")
+        }
+        self.processed.append(event.id)
+        match event.type {
+            case "checkout.session.completed" if event.objectStr("mode") == "subscription" {
+                return Result.Ok("subscribed")
+            }
+            case t if event.isType("invoice.*") {
+                return Result.Ok(t.replace(".", "-"))
+            }
+            case _ {
+                return Result.Ok("ignored")
+            }
+        }
+    }
+}
+
+func outcome(r: Result[str]) -> str {
+    if r.ok() {
+        return r.unwrap()
+    }
+    return "rejected:" + r.error.kind
+}
+
+func eventJson(id: str, eventType: str, object: str) -> str {
+    return f"{{\"id\":\"{id}\",\"object\":\"event\",\"type\":\"{eventType}\",\"created\":1700000000,\"livemode\":false,\"api_version\":\"2024-06-20\",\"data\":{{\"object\":{object}}}}}"
+}
+
+func main() {
+    mock: StripeMock = StripeMock.start(fakeStripe)
+    cfg: StripeConfig = StripeConfig("sk_test_billing", mock.baseUrl, "2024-06-20", 5000, 1)
+    cfg.retryBaseDelayMs = 1
+    billing: Billing = Billing(StripeClient(cfg), "whsec_new, whsec_old")
+    charges: list[Charge] = [
+        Charge("storage", "Storage (GiB-hours)", [1000, 5000, 0], ["0", "0.25", "0.1"]),
+        Charge("egress", "Egress (MiB)", [0], ["0.01"])
+    ]
+
+    # Catalog sync is idempotent: the second run only reads.
+    do {
+        catalog: dict[str, StripeObject] = billing.syncCatalog(charges)?
+        print(f"catalog meters={billing.meters} products={billing.products} prices={billing.prices}")
+        posts: int = len([r for r in mock.requests() if r.method == "POST"])
+        _ = billing.syncCatalog(charges)?
+        print(f"catalog-again meters={billing.meters} products={billing.products} prices={billing.prices} posts={len([r for r in mock.requests() if r.method == 'POST']) - posts}")
+        storage: StripeObject = catalog["storage"]
+        print(f"price tiers {storage.getStr('tiers_mode')} {storage.getStr('recurring.meter')} {storage.getStr('tiers.1.up_to')} {storage.getStr('tiers.1.unit_amount_decimal')}")
+    } catch err {
+        print(f"catalog failed: {err}")
+    }
+
+    client: StripeClient = billing.client
+    customerOpts: StripeCustomerOptions = StripeCustomerOptions("pro@example.com", "Tenant 42")
+    customerOpts.setMetadata("tenant_id", "t-42")
+    customer: StripeResponse = client.createCustomerWithOptions(customerOpts, "customer-t-42").unwrap()
+    fetched: StripeResponse = client.retrieveCustomer(customer.id()).unwrap()
+    print(f"customer {customer.id()} {fetched.metadata('tenant_id')} {fetched.getStr('email')}")
+    updated: StripeResponse = client.updateCustomer(customer.id(), {"email": "billing@example.com", "metadata": {"plan": "pro"}}).unwrap()
+    print(f"customer-updated {updated.getStr('email')} {updated.metadata('plan')}")
+
+    print("checkout " + billing.checkout("t-42", customer.id(), ["price_base", "price_storage", "price_egress"]).unwrap())
+    session: MockRequest = mock.matching("POST", "/checkout/sessions")[0]
+    lines: list[str] = []
+    for i in range(3) {
+        quantity: str = Stripe.formValue(session.body, f"line_items[{i}][quantity]")
+        lines.append(Stripe.formValue(session.body, f"line_items[{i}][price]") + ":" + (quantity if quantity != "" else "-"))
+    }
+    print("checkout-lines " + ",".join(lines))
+    print("portal " + client.createPortalSession(customer.id(), "https://app.test/billing").unwrap().url())
+
+    # Usage: deltas against cumulative totals; a replayed report is refused
+    # by Stripe's identifier check and the app treats it as already sent.
+    sent: int = 0
+    duplicates: int = 0
+    reports: list[list[int]] = [[60, 0], [100, 60], [100, 60]]
+    for pair in reports {
+        r: Result[int] = billing.report("t-42", customer.id(), "storage", 1700000000, pair[0], pair[1])
+        if r.ok() {
+            sent += r.unwrap()
+        } elif StripeError.of(r.error).code == "meter_event_duplicate_identifier" {
+            duplicates += 1
+        }
+    }
+    sent += billing.report("t-42", customer.id(), "egress", 1700000000, 50, 0).unwrap()
+    amounts: list[int] = [v for k, v in Fake.usage]
+    total: int = amounts.reduce(lambda (acc: int, v: int) -> int: acc + v, 0)
+    print(f"usage sent={sent} duplicates={duplicates} total={total} storage={Fake.usage['storage']} egress={Fake.usage['egress']}")
+    events: list[MockRequest] = mock.matching("POST", "/billing/meter_events")
+    print("usage-keys " + Stripe.formValue(events[1].body, "identifier") + " " + events[2].header("Idempotency-Key"))
+
+    # Plan change with proration: swap base and storage, drop egress, add API.
+    _ = billing.changePlan("sub_1", {"pro_base": "price_team_base", "pro_storage": "price_team_storage"}, ["price_team_api"]).unwrap()
+    change: MockRequest = mock.last()
+    parts: list[str] = []
+    for i in range(4) {
+        id: str = Stripe.formValue(change.body, f"items[{i}][id]")
+        target: str = "deleted" if Stripe.formValue(change.body, f"items[{i}][deleted]") == "true" else Stripe.formValue(change.body, f"items[{i}][price]")
+        parts.append(f"{id}>{target}" if id != "" else f"+{target}")
+    }
+    print(f"plan-change items={','.join(parts)} proration={Stripe.formValue(change.body, 'proration_behavior')}")
+
+    print(f"cancel-at-period-end {client.cancelSubscriptionAtPeriodEnd('sub_1').unwrap().getBool('cancel_at_period_end')}")
+    print(f"reactivate {client.reactivateSubscription('sub_1').unwrap().getBool('cancel_at_period_end')}")
+    Fake.subscriptionStatus = "paused"
+    print(f"resume {client.resumeSubscription('sub_1', 'none', 'unchanged').unwrap().getStr('status')}")
+    canceled: StripeResponse = client.cancelSubscription("sub_1", invoiceNow=true).unwrap()
+    print(f"canceled {canceled.getStr('status')} {Fake.subscriptionStatus} {mock.last().query}")
+
+    invoices: StripeList = client.listInvoices(customer.id(), limit=10).unwrap()
+    print(f"invoices {invoices.size()} {','.join(invoices.ids())} {invoices.first().getStr('status')}")
+    invoice: StripeResponse = client.retrieveInvoice(invoices.lastId()).unwrap()
+    print(f"invoice {invoice.id()} {invoice.getInt('amount_due')} {invoice.getStr('hosted_invoice_url')}")
+
+    # Webhooks: verified, deduplicated, rotated secrets, tampering refused.
+    now: int = 1700000000
+    completed: str = eventJson("evt_1", "checkout.session.completed", "{\"id\":\"cs_1\",\"mode\":\"subscription\",\"customer\":\"cus_1\"}")
+    paid: str = eventJson("evt_3", "invoice.paid", "{\"id\":\"in_2\",\"object\":\"invoice\",\"paid\":true}")
+    other: str = eventJson("evt_4", "customer.created", "{\"id\":\"cus_1\"}")
+    Fake.events["evt_3"] = paid
+    results: list[str] = [
+        outcome(billing.handleWebhook(completed, StripeWebhook.testHeader(completed, "whsec_new", now), now)),
+        outcome(billing.handleWebhook(completed, StripeWebhook.testHeader(completed, "whsec_new", now), now)),
+        outcome(billing.handleWebhook(completed + " ", StripeWebhook.testHeader(completed, "whsec_new", now), now)),
+        "rotated:" + outcome(billing.handleWebhook(paid, StripeWebhook.testHeader(paid, "whsec_old", now), now + 10)),
+        outcome(billing.handleWebhook(other, StripeWebhook.testHeader(other, "whsec_new", now), now))
+    ]
+    print("webhook " + " ".join(results))
+
+    # Re-fetch the event by id (trust Stripe, not the payload).
+    fresh: StripeEvent = client.retrieveEvent("evt_3").unwrap()
+    print(f"event {fresh.id} {fresh.type} {fresh.objectId()} {fresh.objectBool('paid')}")
+
+    missing: Result[StripeEvent] = client.retrieveEvent("evt_404")
+    missingErr: StripeError = StripeError.of(missing.error)
+    blank: StripeError = StripeError.of(client.retrieveInvoice("").error)
+    print(f"errors {missingErr.kind}:{missingErr.code}:{missingErr.status} {blank.kind}:{blank.param}")
+    print(f"requests {mock.count()}")
+    mock.stop()
+}

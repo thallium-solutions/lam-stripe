@@ -1,0 +1,83 @@
+# expect: false
+# expect: https://api.stripe.com/v1
+# expect: 30000 2 []
+# expect: StripeConfigError: STRIPE_SECRET_KEY is required
+# expect: true
+# expect: http://127.0.0.1:12111 2024-06-20 acct_123 4500 0
+# expect: true
+# expect: true false
+# expect: 30000 2
+# expect: https://api.stripe.com/v1
+# expect: StripeConfigError
+# expect: true
+# expect: StripeConfigError
+# expect: StripeConfigError
+# expect: StripeConfigError
+# expect: sk_test_local http://localhost:1/v1 2025-01-01 5000 3 acct_9
+# expect: true
+
+from @lam/stripe import StripeConfig, StripeClient, StripeError
+from lamenv import Env
+from lamerrors import Result
+
+func clearStripeEnv() {
+    for name in ["STRIPE_SECRET_KEY", "STRIPE_BASE_URL", "STRIPE_API_VERSION", "STRIPE_ACCOUNT", "STRIPE_TIMEOUT_MS", "STRIPE_MAX_RETRIES"] {
+        _ = Env.unset(name)
+    }
+}
+
+func kindOf(r: Result[bool]) -> str {
+    if r.ok() {
+        return "ok"
+    }
+    return r.error.kind
+}
+
+func main() {
+    clearStripeEnv()
+
+    empty: StripeConfig = StripeConfig.fromEnv()
+    print(empty.isReady())
+    print(empty.baseUrl)
+    print(f"{empty.timeoutMs} {empty.maxRetries} [{empty.stripeAccount}]")
+    print(empty.validate().error)
+
+    _ = Env.set("STRIPE_SECRET_KEY", " sk_test_local ")
+    _ = Env.set("STRIPE_BASE_URL", "http://127.0.0.1:12111")
+    _ = Env.set("STRIPE_API_VERSION", "2024-06-20")
+    _ = Env.set("STRIPE_ACCOUNT", "acct_123")
+    _ = Env.set("STRIPE_TIMEOUT_MS", "4500")
+    _ = Env.set("STRIPE_MAX_RETRIES", "0")
+    ready: StripeConfig = StripeConfig.fromEnv()
+    print(ready.isReady() and ready.secretKey == "sk_test_local")
+    print(f"{ready.baseUrl} {ready.apiVersion} {ready.stripeAccount} {ready.timeoutMs} {ready.maxRetries}")
+    print(ready.validate().ok())
+    print(ready.isTestMode(), StripeConfig("sk_live_x").isTestMode())
+
+    # Malformed optional values keep their defaults.
+    _ = Env.set("STRIPE_TIMEOUT_MS", "soon")
+    _ = Env.set("STRIPE_MAX_RETRIES", "-4")
+    _ = Env.set("STRIPE_BASE_URL", "   ")
+    fallback: StripeConfig = StripeConfig.fromEnv()
+    print(f"{fallback.timeoutMs} {fallback.maxRetries}")
+    print(fallback.baseUrl)
+
+    # Validation rejects keys and settings that cannot work.
+    print(kindOf(StripeConfig("pk_test_abc").validate()))
+    print(StripeConfig("rk_test_abc").validate().ok())
+    print(kindOf(StripeConfig("sk_test_x", "ftp://example.com").validate()))
+    print(kindOf(StripeConfig("sk_test_x", "https://api.stripe.com/v1", "", 0).validate()))
+    negative: StripeConfig = StripeConfig("sk_test_x")
+    negative.maxRetries = -1
+    print(kindOf(negative.validate()))
+
+    # Positional constructor keeps the 0.x order; extra settings are named.
+    positional: StripeConfig = StripeConfig("sk_test_local", "http://localhost:1/v1", "2025-01-01", 5000, maxRetries=3, stripeAccount="acct_9")
+    print(f"{positional.secretKey} {positional.baseUrl} {positional.apiVersion} {positional.timeoutMs} {positional.maxRetries} {positional.stripeAccount}")
+
+    # fromEnv on the client reads the same variables.
+    clearStripeEnv()
+    _ = Env.set("STRIPE_SECRET_KEY", "sk_test_env")
+    print(StripeClient.fromEnv().cfg.secretKey == "sk_test_env")
+    clearStripeEnv()
+}

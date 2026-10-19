@@ -1,0 +1,132 @@
+# expect: 3 true cus_7,cus_6,cus_5
+# expect: 3 cus_7,cus_6,cus_5|cus_4,cus_3,cus_2|cus_1
+# expect: limit=3|limit=3&starting_after=cus_5|limit=3&starting_after=cus_2
+# expect: 7 cus_7 cus_1
+# expect: 4 cus_7,cus_6,cus_5,cus_4
+# expect: cus_3,cus_2|cus_5,cus_4
+# expect: page3 2 s1,s2|s3,s4|s5
+# expect: StripeApiError 2 cus_7,cus_6
+# expect: StripeValidationError
+# expect: 0 0
+# expect: 2 mtr_a,mtr_c
+# expect: mtr_c
+# expect: true
+from @lam/stripe import StripeClient, StripeConfig, StripeList, StripeObject, StripePager, Stripe
+from stripe_mock import StripeMock, MockRequest, MockReply
+from lamerrors import Result
+
+func page(ids: list[str], hasMore: bool, objectType: str = "list", nextPage: str = "") -> str {
+    items: list[str] = [f"{{\"id\":\"{id}\",\"object\":\"customer\"}}" for id in ids]
+    more: str = "true" if hasMore else "false"
+    extra: str = f",\"next_page\":\"{nextPage}\"" if nextPage != "" else ""
+    return f"{{\"object\":\"{objectType}\",\"url\":\"/v1/customers\",\"has_more\":{more}{extra},\"data\":[" + ",".join(items) + "]}"
+}
+
+func handle(req: MockRequest) -> MockReply {
+    all: list[str] = ["cus_7", "cus_6", "cus_5", "cus_4", "cus_3", "cus_2", "cus_1"]
+    limit: int = 10
+    q: str = req.query
+    limitText: str = Stripe.formValue(q, "limit")
+    if limitText != "" {
+        limit = int(limitText)
+    }
+    if req.path == "/v1/customers/search" {
+        token: str = Stripe.formValue(q, "page")
+        if token == "" {
+            return MockReply.json(page(["s1", "s2"], true, "search_result", "page2"))
+        }
+        if token == "page2" {
+            return MockReply.json(page(["s3", "s4"], true, "search_result", "page3"))
+        }
+        return MockReply.json(page(["s5"], false, "search_result"))
+    }
+    if req.path == "/v1/billing/meters" {
+        if Stripe.formValue(q, "starting_after") == "" {
+            return MockReply.json("{\"object\":\"list\",\"has_more\":true,\"data\":[{\"id\":\"mtr_a\",\"event_name\":\"storage\",\"status\":\"active\"}]}")
+        }
+        return MockReply.json("{\"object\":\"list\",\"has_more\":false,\"data\":[{\"id\":\"mtr_c\",\"event_name\":\"egress\",\"status\":\"active\"}]}")
+    }
+    if req.path == "/v1/broken" {
+        if Stripe.formValue(q, "starting_after") != "" {
+            return MockReply.error(500, "api_error", "boom")
+        }
+        return MockReply.json(page(["cus_7", "cus_6"], true))
+    }
+    start: int = 0
+    stop: int = len(all)
+    after: str = Stripe.formValue(q, "starting_after")
+    before: str = Stripe.formValue(q, "ending_before")
+    for i in range(len(all)) {
+        if all[i] == after {
+            start = i + 1
+        }
+        if all[i] == before {
+            stop = i
+        }
+    }
+    if before != "" {
+        start = stop - limit if stop - limit > 0 else 0
+        return MockReply.json(page(all[start:stop], start > 0))
+    }
+    end: int = start + limit if start + limit < stop else stop
+    return MockReply.json(page(all[start:end], end < stop))
+}
+
+func main() {
+    mock: StripeMock = StripeMock.start(handle)
+    cfg: StripeConfig = StripeConfig("sk_test_pages", mock.baseUrl, "", 2000, 0)
+    client: StripeClient = StripeClient(cfg)
+
+    first: StripeList = client.listCustomers({"limit": 3}).unwrap()
+    print(first.size(), first.hasMore, ",".join(first.ids()))
+
+    # Manual iteration with the pager.
+    pages: StripePager = client.pager("/customers", {"limit": 3})
+    seen: list[str] = []
+    while pages.hasNext() {
+        current: StripeList = pages.next().unwrap()
+        seen.append(",".join(current.ids()))
+    }
+    print(pages.pages, "|".join(seen))
+    queries: list[str] = [r.query.replace("%5B", "[").replace("%5D", "]") for r in mock.matching("GET", "/customers")]
+    print("|".join(queries[1:]))
+
+    # listAll follows has_more; maxItems stops early.
+    everything: list[StripeObject] = client.listAll("/customers", {"limit": 2}).unwrap()
+    print(len(everything), everything[0].id(), everything[len(everything) - 1].id())
+    capped: list[StripeObject] = client.listAll("/customers", {"limit": 3}, maxItems=4).unwrap()
+    print(len(capped), ",".join([c.id() for c in capped]))
+
+    # Backwards with ending_before.
+    back: StripePager = client.pager("/customers", {"limit": 2, "ending_before": "cus_1"})
+    backPages: list[str] = []
+    while back.hasNext() and len(backPages) < 2 {
+        backPages.append(",".join(back.next().unwrap().ids()))
+    }
+    print("|".join(backPages))
+
+    # Search results continue with the page token.
+    search: StripePager = client.pager("/customers/search", {"query": "email:'a@b.c'"})
+    found: list[str] = []
+    while search.hasNext() {
+        found.append(",".join(search.next().unwrap().ids()))
+    }
+    tokens: list[str] = [Stripe.formValue(r.query, "page") for r in mock.matching("GET", "/customers/search")]
+    print(tokens[2], len([t for t in tokens if t != ""]), "|".join(found))
+
+    # An error on a later page ends the iteration with the error.
+    broken: StripePager = client.pager("/broken")
+    firstBroken: StripeList = broken.next().unwrap()
+    failed: Result[StripeList] = broken.next()
+    print(failed.error.kind, broken.pages + 1, ",".join(firstBroken.ids()))
+    print(broken.next().error.kind)
+    partial: Result[list[StripeObject]] = client.listAll("/broken")
+    print(0 if not partial.ok() else 1, len(mock.matching("GET", "/nothing")))
+
+    # Typed helpers built on the pager.
+    meters: list[StripeObject] = client.listMeters().unwrap()
+    print(len(meters), ",".join([m.id() for m in meters]))
+    print(client.findMeterByEventName("egress").unwrap().id())
+    print(client.findMeterByEventName("unknown").unwrap() == None)
+    mock.stop()
+}

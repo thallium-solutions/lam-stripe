@@ -1,0 +1,149 @@
+# expect: true 3 3 true
+# expect: true 2 429
+# expect: true 2
+# expect: StripeApiError 1 false
+# expect: true 2
+# expect: StripeApiError 3 true 503 req_mock_error
+# expect: true
+# expect: StripeCardError 1
+# expect: 1
+# expect: StripeConnectionError 2 2
+# expect: StripeConnectionError 3 true
+# expect: StripeApiError 1 false
+# expect: StripeConnectionError 1
+# expect: true
+from @lam/stripe import StripeClient, StripeConfig, StripeResponse, StripeRequestOptions, StripeError
+from stripe_mock import StripeMock, MockRequest, MockReply
+from lamerrors import Result
+from lamtime import Time
+
+class Script {
+    static hits: dict[str, int] = {}
+}
+
+func hit(path: str) -> int {
+    n: int = 1
+    if path in Script.hits {
+        n = Script.hits[path] + 1
+    }
+    Script.hits[path] = n
+    return n
+}
+
+func handle(req: MockRequest) -> MockReply {
+    n: int = hit(req.path)
+    ok: MockReply = MockReply.json("{\"id\":\"ok_" + str(n) + "\"}")
+    if req.path == "/v1/flaky" {
+        return MockReply.error(500, "api_error", "try again") if n < 3 else ok
+    }
+    if req.path == "/v1/ratelimited" {
+        if n == 1 {
+            limited: MockReply = MockReply.error(429, "invalid_request_error", "slow down", "rate_limit")
+            limited.headers["Retry-After"] = "1"
+            return limited
+        }
+        return ok
+    }
+    if req.path == "/v1/lock" {
+        return MockReply.error(409, "invalid_request_error", "lock_timeout", "lock_timeout") if n == 1 else ok
+    }
+    if req.path == "/v1/noretry" {
+        refused: MockReply = MockReply.error(500, "api_error", "do not retry")
+        refused.headers["Stripe-Should-Retry"] = "false"
+        return refused
+    }
+    if req.path == "/v1/forceretry" {
+        if n == 1 {
+            forced: MockReply = MockReply.error(400, "invalid_request_error", "transient")
+            forced.headers["Stripe-Should-Retry"] = "true"
+            return forced
+        }
+        return ok
+    }
+    if req.path == "/v1/down" or req.path == "/v1/down-once" or req.path == "/v1/down-post" {
+        return MockReply.error(503, "api_error", "unavailable")
+    }
+    if req.path == "/v1/declined" {
+        return MockReply.error(402, "card_error", "declined", "card_declined")
+    }
+    if req.path == "/v1/slow" {
+        return MockReply(200, "{}", {}, 400)
+    }
+    return ok
+}
+
+func err(r: Result[StripeResponse]) -> StripeError {
+    return StripeError.of(r.error)
+}
+
+func main() {
+    mock: StripeMock = StripeMock.start(handle)
+    cfg: StripeConfig = StripeConfig("sk_test_retries", mock.baseUrl, "", 2000, 2)
+    cfg.retryBaseDelayMs = 20
+    cfg.retryMaxDelayMs = 50
+    client: StripeClient = StripeClient(cfg)
+
+    # Two 500s then success: one idempotency key across all attempts.
+    flaky: StripeResponse = client.post("/flaky", {"amount": 1}).unwrap()
+    keys: list[str] = [r.header("Idempotency-Key") for r in mock.matching("POST", "/flaky")]
+    print(flaky.ok(), flaky.attempts, len(keys), keys[0] == keys[1] and keys[1] == keys[2] and keys[0] == flaky.idempotencyKey)
+
+    # 429 with Retry-After (capped by retryMaxDelayMs), then success.
+    started: int = Time.nowUnixMilli()
+    limited: StripeResponse = client.get("/ratelimited").unwrap()
+    print(limited.attempts == 2 and Time.nowUnixMilli() - started >= 50, limited.attempts, 429)
+
+    lock: StripeResponse = client.get("/lock").unwrap()
+    print(lock.ok(), lock.attempts)
+
+    # Stripe-Should-Retry decides over the status code.
+    refused: StripeError = err(client.get("/noretry"))
+    print(refused.kind, refused.attempts, refused.retryable)
+    forced: StripeResponse = client.get("/forceretry").unwrap()
+    print(forced.ok(), forced.attempts)
+
+    # Retries are exhausted: the last error comes back with the attempt count.
+    started = Time.nowUnixMilli()
+    down: StripeError = err(client.get("/down"))
+    elapsed: int = Time.nowUnixMilli() - started
+    print(down.kind, down.attempts, down.retryable, down.status, down.requestId)
+    # Backoff: >= 10 ms (half of 20) + 20 ms (half of 40) between attempts.
+    print(elapsed >= 30)
+
+    # Card errors are final.
+    declined: StripeError = err(client.get("/declined"))
+    print(declined.kind, declined.attempts)
+
+    # Per-request retry override.
+    before: int = len(mock.matching("GET", "/down-once"))
+    _ = client.get("/down-once", {}, StripeRequestOptions().retries(0))
+    print(len(mock.matching("GET", "/down-once")) - before)
+
+    # Timeouts are connection errors and are retried.
+    slowOpts: StripeRequestOptions = StripeRequestOptions().retries(1)
+    slowOpts.timeoutMs = 100
+    slow: StripeError = err(client.get("/slow", {}, slowOpts))
+    Time.sleepMs(700)
+    print(slow.kind, slow.attempts, len(mock.matching("GET", "/slow")))
+
+    # Network failures (nothing listening) are retried too.
+    mock.stop()
+    gone: StripeClient = StripeClient(cfg)
+    lost: StripeError = err(gone.retrieveBalance())
+    print(lost.kind, lost.attempts, gone.requestCount == 3)
+
+    # A POST without an idempotency key is never retried.
+    mock = StripeMock.start(handle)
+    noKeys: StripeConfig = StripeConfig("sk_test_retries", mock.baseUrl, "", 2000, 2)
+    noKeys.retryBaseDelayMs = 1
+    noKeys.autoIdempotencyKeys = false
+    unsafe: StripeClient = StripeClient(noKeys)
+    once: StripeError = err(unsafe.post("/down-post"))
+    print(once.kind, once.attempts, once.idempotencyKey != "")
+    mock.stop()
+    lostPost: StripeError = err(unsafe.post("/customers"))
+    print(lostPost.kind, lostPost.attempts)
+    # With a key it is retried.
+    keyed: StripeError = err(unsafe.post("/customers", {}, StripeRequestOptions("order-1")))
+    print(keyed.attempts == 3 and keyed.idempotencyKey == "order-1")
+}

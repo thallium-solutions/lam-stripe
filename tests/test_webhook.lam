@@ -1,0 +1,97 @@
+# expect: t=1700000000,v1=c0ee6edea20ccd4d3dcb64382342db8246597b29cf1514b38ad2dc15c6eb7887
+# expect: true evt_1 invoice.paid in_1
+# expect: StripeSignatureError tampered
+# expect: StripeSignatureError stale
+# expect: StripeSignatureError future
+# expect: true
+# expect: StripeSignatureError wrong-secret
+# expect: true multi
+# expect: true rotation-old
+# expect: true rotation-new
+# expect: StripeSignatureError rotation-none
+# expect: missing timestamp v1 v1 timestamp timestamp conflicting
+# expect: true v0-ignored
+# expect: true upper-hex
+# expect: StripeSignatureError no-secret
+# expect: StripeValidationError signed-garbage
+# expect: true construct
+# expect: whsec_a,whsec_b,whsec_c
+# expect: true
+# expect: 1700000000 2
+from @lam/stripe import StripeWebhook, StripeEvent, StripeSignatureHeader
+from lamerrors import Result
+from lamtime import Time
+
+const Secret: str = "whsec_test_secret"
+const Payload: str = "{\"id\":\"evt_1\",\"object\":\"event\",\"type\":\"invoice.paid\",\"created\":1700000000,\"data\":{\"object\":{\"id\":\"in_1\",\"object\":\"invoice\"}}}"
+
+func outcome(r: Result[bool], label: str) -> str {
+    if r.ok() {
+        return f"true {label}"
+    }
+    return f"{r.error.kind} {label}"
+}
+
+func reason(header: str) -> str {
+    r: Result[StripeSignatureHeader] = StripeWebhook.parseHeader(header)
+    if r.ok() {
+        return "ok"
+    }
+    words: list[str] = r.error.message.split(" ")
+    for w in ["missing", "conflicting", "v1", "timestamp"] {
+        if w in words {
+            return w
+        }
+    }
+    return r.error.message
+}
+
+func main() {
+    header: str = StripeWebhook.testHeader(Payload, Secret, 1700000000)
+    # Matches an independent HMAC-SHA256 (Python's hmac module).
+    print(header)
+
+    event: Result[StripeEvent] = StripeWebhook.verify(Payload, header, Secret, 300, 1700000100)
+    print(event.ok(), event.unwrap().id, event.unwrap().type, event.unwrap().objectId())
+
+    # Same checks as MFT's Signatures.verifyStripe unit test.
+    print(outcome(StripeWebhook.verifySignature(Payload + " ", header, Secret, 300, 1700000100), "tampered"))
+    print(outcome(StripeWebhook.verifySignature(Payload, header, Secret, 300, 1700001000), "stale"))
+    print(outcome(StripeWebhook.verifySignature(Payload, header, Secret, 300, 1699999000), "future"))
+    print(StripeWebhook.verifySignature(Payload, header, Secret, 0, 1).ok())
+    print(outcome(StripeWebhook.verifySignature(Payload, header, "whsec_other", 300, 1700000100), "wrong-secret"))
+
+    # Any matching v1 is accepted (Stripe sends one per active secret).
+    sig: str = StripeWebhook.sign(Payload, Secret, 1700000000)
+    multi: str = f"t=1700000000,v1={'0' * 64},v1={sig}"
+    print(outcome(StripeWebhook.verifySignature(Payload, multi, Secret, 300, 1700000000), "multi"))
+
+    # Secret rotation: verify against the new and the old secret.
+    oldHeader: str = StripeWebhook.testHeader(Payload, "whsec_old", 1700000000)
+    newHeader: str = StripeWebhook.testHeader(Payload, "whsec_new", 1700000000)
+    secrets: list[str] = ["whsec_new", "whsec_old"]
+    print(outcome(StripeWebhook.verifySignatureAny(Payload, oldHeader, secrets, 300, 1700000000), "rotation-old"))
+    print(outcome(StripeWebhook.verifySignatureAny(Payload, newHeader, secrets, 300, 1700000000), "rotation-new"))
+    print(outcome(StripeWebhook.verifySignatureAny(Payload, oldHeader, ["whsec_new", " "], 300, 1700000000), "rotation-none"))
+
+    # Malformed headers.
+    print(reason(""), reason("v1=abc"), reason("t=1700000000"), reason("t=1700000000,v1="), reason("t=soon,v1=abc"), reason("t=-5,v1=abc"), reason("t=1,t=2,v1=abc"))
+    v0: str = f"t=1700000000, v0={'f' * 64} , v1={sig}"
+    print(outcome(StripeWebhook.verifySignature(Payload, v0, Secret, 300, 1700000000), "v0-ignored"))
+    print(outcome(StripeWebhook.verifySignature(Payload, f"t=1700000000,v1={sig.toUpper()}", Secret, 300, 1700000000), "upper-hex"))
+    print(outcome(StripeWebhook.verifySignature(Payload, header, "", 300, 1700000000), "no-secret"))
+
+    # A correctly signed body that is not an event is still rejected.
+    garbage: str = "not json"
+    signedGarbage: Result[StripeEvent] = StripeWebhook.verify(garbage, StripeWebhook.testHeader(garbage, Secret, 1700000000), Secret, 300, 1700000000)
+    print(f"{signedGarbage.error.kind} signed-garbage")
+
+    # constructEvent uses the current time and accepts a secret list.
+    now: int = Time.nowUnix()
+    live: Result[StripeEvent] = StripeWebhook.constructEvent(Payload, StripeWebhook.testHeader(Payload, "whsec_b", now), "whsec_a, whsec_b")
+    print(f"{live.ok()} construct")
+    print(",".join(StripeWebhook.splitSecrets(" whsec_a,whsec_b\nwhsec_c whsec_a ,, ")))
+    print(StripeWebhook.defaultTolerance() == 300)
+    parsed: StripeSignatureHeader = StripeWebhook.parseHeader(multi).unwrap()
+    print(parsed.timestamp, len(parsed.signatures))
+}

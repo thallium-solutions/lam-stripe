@@ -1,0 +1,150 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+
+from lamconv import Conv
+from lamerrors import Result
+from lamhash import Hash
+from lamtime import Time
+from .errors import StripeError
+from .models import StripeEvent
+
+#- Stripe's default signature tolerance (five minutes). -#
+const StripeWebhookDefaultTolerance: int = 300
+
+#- A parsed ``Stripe-Signature`` header: ``t=<unix>`` plus every ``v1``
+   signature (Stripe sends several while a signing secret is being
+   rolled). Other schemes (``v0``) are ignored. -#
+class StripeSignatureHeader {
+    func init(self, timestamp: int = 0, signatures: list[str] = []) {
+        self.timestamp: int = timestamp
+        self.signatures: list[str] = signatures
+    }
+}
+
+#- Webhook signature verification (HMAC-SHA256 over ``"<t>.<raw body>"``)
+   and test helpers. Always verify the exact raw request body: parsing and
+   re-encoding the JSON changes the bytes and breaks the signature. -#
+class StripeWebhook {
+    static func defaultTolerance() -> int {
+        return StripeWebhookDefaultTolerance
+    }
+
+    #- Hex HMAC-SHA256 signature of ``payload`` at ``timestamp``. -#
+    static func sign(payload: str, secret: str, timestamp: int) -> str {
+        return Hash.hmacSha256(secret, str(timestamp) + "." + payload)
+    }
+
+    #- A valid ``Stripe-Signature`` header for tests and local tools:
+       ``t=<timestamp>,v1=<signature>``. -#
+    static func testHeader(payload: str, secret: str, timestamp: int) -> str {
+        return f"t={timestamp},v1={StripeWebhook.sign(payload, secret, timestamp)}"
+    }
+
+    #- Splits a list of signing secrets separated by commas, spaces or new
+       lines (``STRIPE_WEBHOOK_SECRET="whsec_new,whsec_old"``). -#
+    static func splitSecrets(text: str) -> list[str] {
+        out: list[str] = []
+        normalized: str = text.replace("\n", ",").replace("\r", ",").replace("\t", ",").replace(" ", ",")
+        for part in normalized.split(",") {
+            secret: str = part.trim()
+            if secret != "" and secret not in out {
+                out.append(secret)
+            }
+        }
+        return out
+    }
+
+    static func parseHeader(header: str) -> Result[StripeSignatureHeader] {
+        if header.trim() == "" {
+            return Result.Err(StripeError.signature("missing Stripe-Signature header"))
+        }
+        timestamp: str = ""
+        signatures: list[str] = []
+        for rawPart in header.split(",") {
+            part: str = rawPart.trim()
+            equals: int = part.index("=")
+            if equals <= 0 {
+                continue
+            }
+            key: str = part[:equals].trim()
+            value: str = part[equals + 1:].trim()
+            if key == "t" {
+                if timestamp != "" and timestamp != value {
+                    return Result.Err(StripeError.signature("Stripe-Signature header has conflicting timestamps"))
+                }
+                timestamp = value
+            } elif key == "v1" and value != "" {
+                signatures.append(value.toLower())
+            }
+        }
+        if timestamp == "" {
+            return Result.Err(StripeError.signature("Stripe-Signature header has no timestamp"))
+        }
+        if len(signatures) == 0 {
+            return Result.Err(StripeError.signature("Stripe-Signature header has no v1 signature"))
+        }
+        parsed: Result[int] = Conv.parse(timestamp)
+        if not parsed.ok() or parsed.unwrap() <= 0 {
+            return Result.Err(StripeError.signature("invalid timestamp in Stripe-Signature header"))
+        }
+        return Result.Ok(StripeSignatureHeader(parsed.unwrap(), signatures))
+    }
+
+    #- Checks the signature against any of ``secrets`` (rotation) and the
+       timestamp against ``toleranceSeconds`` (in either direction;
+       ``<= 0`` disables the check). Comparisons are constant-time. -#
+    static func verifySignatureAny(payload: str, header: str, secrets: list[str], toleranceSeconds: int, nowUnix: int) -> Result[bool] {
+        usable: list[str] = []
+        for secret in secrets {
+            if secret.trim() != "" {
+                usable.append(secret.trim())
+            }
+        }
+        if len(usable) == 0 {
+            return Result.Err(StripeError.signature("webhook signing secret is not configured"))
+        }
+        parsed: StripeSignatureHeader = StripeWebhook.parseHeader(header)?
+        if toleranceSeconds > 0 {
+            delta: int = nowUnix - parsed.timestamp
+            if delta < 0 {
+                delta = -delta
+            }
+            if delta > toleranceSeconds {
+                return Result.Err(StripeError.signature(f"Stripe-Signature timestamp is outside the {toleranceSeconds}s tolerance"))
+            }
+        }
+        matched: bool = false
+        for secret in usable {
+            expected: str = StripeWebhook.sign(payload, secret, parsed.timestamp)
+            for candidate in parsed.signatures {
+                if Hash.constantTimeEquals(candidate, expected) {
+                    matched = true
+                }
+            }
+        }
+        if not matched {
+            return Result.Err(StripeError.signature("no Stripe-Signature v1 signature matches the payload"))
+        }
+        return Result.Ok(true)
+    }
+
+    static func verifySignature(payload: str, header: str, secret: str, toleranceSeconds: int, nowUnix: int) -> Result[bool] {
+        return StripeWebhook.verifySignatureAny(payload, header, [secret], toleranceSeconds, nowUnix)
+    }
+
+    #- Verifies the signature, then parses the event. -#
+    static func verifyAny(payload: str, header: str, secrets: list[str], toleranceSeconds: int, nowUnix: int) -> Result[StripeEvent] {
+        _ = StripeWebhook.verifySignatureAny(payload, header, secrets, toleranceSeconds, nowUnix)?
+        return StripeEvent.parse(payload)
+    }
+
+    static func verify(payload: str, header: str, secret: str, toleranceSeconds: int, nowUnix: int) -> Result[StripeEvent] {
+        return StripeWebhook.verifyAny(payload, header, [secret], toleranceSeconds, nowUnix)
+    }
+
+    #- ``verify`` with the current time and, by default, Stripe's 300 s
+       tolerance. ``secret`` may list several secrets (``splitSecrets``). -#
+    static func constructEvent(payload: str, header: str, secret: str, toleranceSeconds: int = 300) -> Result[StripeEvent] {
+        return StripeWebhook.verifyAny(payload, header, StripeWebhook.splitSecrets(secret), toleranceSeconds, Time.nowUnix())
+    }
+}

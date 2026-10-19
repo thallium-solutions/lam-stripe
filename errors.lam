@@ -1,0 +1,230 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+
+from lamerrors import Result, Error
+from lamjson import Json
+
+go! {
+    import (
+        "fmt"
+        "strconv"
+    )
+
+    // stripeErrorText reads one string member of a decoded Stripe error
+    // object; numbers are formatted, other shapes yield "".
+    func stripeErrorText(object map[string]interface{}, key string) string {
+        switch v := object[key].(type) {
+        case string:
+            return v
+        case int:
+            return strconv.Itoa(v)
+        case int64:
+            return strconv.FormatInt(v, 10)
+        case float64:
+            return strconv.FormatFloat(v, 'f', -1, 64)
+        case bool:
+            return strconv.FormatBool(v)
+        case nil:
+            return ""
+        default:
+            return fmt.Sprint(v)
+        }
+    }
+}
+
+#- Every failure returned by @lam/stripe is a ``StripeError``: a
+   ``lamerrors.Error`` subclass, so ``err.kind`` / ``err.message`` work in
+   ``do { } catch err``, and ``StripeError.of(err)`` or
+   ``isinstance(err, StripeError)`` reach the Stripe details.
+
+   ``kind`` is one of ``StripeCardError``, ``StripeInvalidRequestError``,
+   ``StripeAuthenticationError``, ``StripePermissionError``,
+   ``StripeRateLimitError``, ``StripeIdempotencyError``, ``StripeApiError``
+   (API responses), ``StripeConnectionError`` (transport failures and
+   timeouts), ``StripeConfigError``, ``StripeValidationError`` (rejected
+   before any request) and ``StripeSignatureError`` (webhooks). -#
+class StripeError(Error) {
+    func init(self, kind: str, message: str, status: int = 0, cause: any = None) {
+        base.init(kind, message, cause)
+        #- HTTP status of the failed response, 0 when no response arrived. -#
+        self.status: int = status
+        #- Stripe ``error.type`` (``card_error``, ``invalid_request_error``, ...). -#
+        self.type: str = ""
+        self.code: str = ""
+        self.declineCode: str = ""
+        self.param: str = ""
+        self.docUrl: str = ""
+        self.requestLogUrl: str = ""
+        #- ``Request-Id`` response header; quote it to Stripe support. -#
+        self.requestId: str = ""
+        #- ``Idempotency-Key`` sent with the request ("" for none). -#
+        self.idempotencyKey: str = ""
+        #- Requests sent, retries included (0 when rejected before sending). -#
+        self.attempts: int = 0
+        #- True when Stripe or the status code marked the request retryable. -#
+        self.retryable: bool = false
+        #- Raw response body. -#
+        self.body: str = ""
+        #- The decoded ``error`` object of the response (``{}`` otherwise). -#
+        self.raw: json = {}
+    }
+
+    func __str__(self) -> str {
+        details: list[str] = []
+        if self.status > 0 {
+            details.append(f"status={self.status}")
+        }
+        if self.type != "" {
+            details.append(f"type={self.type}")
+        }
+        if self.code != "" {
+            details.append(f"code={self.code}")
+        }
+        if self.declineCode != "" {
+            details.append(f"decline_code={self.declineCode}")
+        }
+        if self.param != "" {
+            details.append(f"param={self.param}")
+        }
+        if self.requestId != "" {
+            details.append(f"request_id={self.requestId}")
+        }
+        if self.attempts > 1 {
+            details.append(f"attempts={self.attempts}")
+        }
+        text: str = f"{self.kind}: {self.message}"
+        if len(details) > 0 {
+            text = text + " [" + " ".join(details) + "]"
+        }
+        if self.cause != None {
+            text = text + f" (cause: {self.cause})"
+        }
+        return text
+    }
+
+    func isCardError(self) -> bool {
+        return self.kind == "StripeCardError"
+    }
+
+    func isRateLimit(self) -> bool {
+        return self.kind == "StripeRateLimitError"
+    }
+
+    func isConnectionError(self) -> bool {
+        return self.kind == "StripeConnectionError"
+    }
+
+    #- The ``StripeError`` inside ``value`` (``r.error`` or a ``catch``
+       binding), or ``None`` when ``value`` is some other error. -#
+    static func of(value: any) -> StripeError {
+        if isinstance(value, StripeError) {
+            return value
+        }
+        return None
+    }
+
+    static func config(message: str) -> StripeError {
+        return StripeError("StripeConfigError", message)
+    }
+
+    static func validation(message: str, param: str = "") -> StripeError {
+        err: StripeError = StripeError("StripeValidationError", message)
+        err.param = param
+        return err
+    }
+
+    static func signature(message: str) -> StripeError {
+        return StripeError("StripeSignatureError", message)
+    }
+
+    static func connection(method: str, target: str, cause: any) -> StripeError {
+        err: StripeError = StripeError("StripeConnectionError", f"{method} {target}: request failed before a response was received", 0, cause)
+        err.retryable = true
+        return err
+    }
+
+    #- The error kind for an API response: the Stripe ``error.type`` decides
+       first, then the HTTP status. -#
+    static func kindFor(status: int, errorType: str) -> str {
+        if errorType == "card_error" {
+            return "StripeCardError"
+        }
+        if errorType == "idempotency_error" {
+            return "StripeIdempotencyError"
+        }
+        if status == 401 {
+            return "StripeAuthenticationError"
+        }
+        if status == 403 {
+            return "StripePermissionError"
+        }
+        if status == 429 {
+            return "StripeRateLimitError"
+        }
+        if status == 402 {
+            return "StripeCardError"
+        }
+        if errorType == "invalid_request_error" or status == 400 or status == 404 {
+            return "StripeInvalidRequestError"
+        }
+        return "StripeApiError"
+    }
+
+    #- Builds the typed error of a non-2xx Stripe response. -#
+    static func fromResponse(status: int, body: str, requestId: str = "") -> StripeError {
+        object: dict[str, any] = {}
+        parsed: json = {}
+        hasObject: bool = false
+        if body != "" {
+            decoded: Result[json] = Json.decode(body)
+            if decoded.ok() {
+                document: json = decoded.unwrap()
+                go! {
+                    if root, ok := lamJSONRaw(document).(map[string]interface{}); ok {
+                        if inner, ok := root["error"].(map[string]interface{}); ok {
+                            object = inner
+                            hasObject = true
+                        }
+                    }
+                }
+                if hasObject {
+                    parsed = document["error"]
+                }
+            }
+        }
+        errorType: str = ""
+        message: str = ""
+        code: str = ""
+        declineCode: str = ""
+        param: str = ""
+        docUrl: str = ""
+        logUrl: str = ""
+        go! {
+            errorType = stripeErrorText(object, "type")
+            message = stripeErrorText(object, "message")
+            code = stripeErrorText(object, "code")
+            declineCode = stripeErrorText(object, "decline_code")
+            param = stripeErrorText(object, "param")
+            docUrl = stripeErrorText(object, "doc_url")
+            logUrl = stripeErrorText(object, "request_log_url")
+        }
+        if message == "" {
+            if body != "" and not hasObject {
+                message = body
+            } else {
+                message = f"stripe request failed with status {status}"
+            }
+        }
+        err: StripeError = StripeError(StripeError.kindFor(status, errorType), message, status)
+        err.type = errorType
+        err.code = code
+        err.declineCode = declineCode
+        err.param = param
+        err.docUrl = docUrl
+        err.requestLogUrl = logUrl
+        err.requestId = requestId
+        err.body = body
+        err.raw = parsed
+        return err
+    }
+}

@@ -1,0 +1,419 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+
+from lamerrors import Result
+from lamjson import Json
+from .errors import StripeError
+
+go! {
+    import (
+        "fmt"
+        "strconv"
+        "strings"
+    )
+
+    // stripeWalk follows a dotted path ("items.data.0.price.id") through
+    // decoded JSON; list segments are zero-based indexes.
+    func stripeWalk(value interface{}, path string) (interface{}, bool) {
+        current := value
+        if path == "" {
+            return current, true
+        }
+        for _, segment := range strings.Split(path, ".") {
+            switch typed := current.(type) {
+            case map[string]interface{}:
+                next, ok := typed[segment]
+                if !ok {
+                    return nil, false
+                }
+                current = next
+            case []interface{}:
+                idx, err := strconv.Atoi(segment)
+                if err != nil || idx < 0 || idx >= len(typed) {
+                    return nil, false
+                }
+                current = typed[idx]
+            default:
+                return nil, false
+            }
+        }
+        return current, true
+    }
+
+    func stripeText(value interface{}) string {
+        switch v := value.(type) {
+        case nil:
+            return ""
+        case string:
+            return v
+        case bool:
+            return strconv.FormatBool(v)
+        case int:
+            return strconv.Itoa(v)
+        case int64:
+            return strconv.FormatInt(v, 10)
+        case float64:
+            return strconv.FormatFloat(v, 'f', -1, 64)
+        case map[string]interface{}:
+            // An expanded object: its id is the useful text form.
+            if id, ok := v["id"].(string); ok {
+                return id
+            }
+            return ""
+        default:
+            return fmt.Sprint(v)
+        }
+    }
+
+    func stripeInt(value interface{}) int {
+        switch v := value.(type) {
+        case int:
+            return v
+        case int64:
+            return int(v)
+        case float64:
+            return int(v)
+        case bool:
+            if v {
+                return 1
+            }
+            return 0
+        case string:
+            n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+            if err == nil {
+                return int(n)
+            }
+        }
+        return 0
+    }
+
+    func stripeBool(value interface{}) bool {
+        switch v := value.(type) {
+        case bool:
+            return v
+        case string:
+            return v == "true"
+        case int:
+            return v != 0
+        case int64:
+            return v != 0
+        case float64:
+            return v != 0
+        }
+        return false
+    }
+
+    func stripeLen(value interface{}) int {
+        switch v := value.(type) {
+        case []interface{}:
+            return len(v)
+        case map[string]interface{}:
+            return len(v)
+        case string:
+            return len(v)
+        }
+        return 0
+    }
+}
+
+#- A decoded Stripe object with null-safe accessors. Paths are dotted
+   (``"items.data.0.price.id"``, ``"metadata.tenant_id"``); a missing value
+   yields "", 0, false, an empty list or JSON null. An expanded object read
+   with ``getStr`` returns its ``id``, so code works whether or not a field
+   was expanded. -#
+class StripeObject {
+    func init(self, data: json = {}) {
+        self.data: json = data
+    }
+
+    func _find(self, path: str) -> any {
+        found: any = None
+        go! {
+            found, _ = stripeWalk(lamJSONRaw(s.Data), path)
+        }
+        return found
+    }
+
+    func has(self, path: str) -> bool {
+        present: bool = false
+        go! {
+            var value interface{}
+            value, present = stripeWalk(lamJSONRaw(s.Data), path)
+            present = present && value != nil
+        }
+        return present
+    }
+
+    func getJson(self, path: str) -> json {
+        found: any = self._find(path)
+        go! {
+            return lamJSONWrapRaw(found)
+        }
+    }
+
+    func getStr(self, path: str) -> str {
+        found: any = self._find(path)
+        go! {
+            return stripeText(found)
+        }
+    }
+
+    func getInt(self, path: str) -> int {
+        found: any = self._find(path)
+        go! {
+            return stripeInt(found)
+        }
+    }
+
+    func getBool(self, path: str) -> bool {
+        found: any = self._find(path)
+        go! {
+            return stripeBool(found)
+        }
+    }
+
+    #- Length of the list, object or string at ``path`` (0 when missing). -#
+    func getLen(self, path: str) -> int {
+        found: any = self._find(path)
+        go! {
+            return stripeLen(found)
+        }
+    }
+
+    #- The objects of the list at ``path`` (``"data"``, ``"items.data"``). -#
+    func getList(self, path: str) -> list[StripeObject] {
+        out: list[StripeObject] = []
+        count: int = self.getLen(path)
+        for i in range(count) {
+            out.append(StripeObject(self.getJson(f"{path}.{i}")))
+        }
+        return out
+    }
+
+    #- The object at ``path`` (an expanded field, ``"price"``, ...). -#
+    func getObject(self, path: str) -> StripeObject {
+        return StripeObject(self.getJson(path))
+    }
+
+    #- ``metadata[key]`` (keys may contain dots). -#
+    func metadata(self, key: str) -> str {
+        found: any = None
+        go! {
+            if root, ok := lamJSONRaw(s.Data).(map[string]interface{}); ok {
+                if meta, ok := root["metadata"].(map[string]interface{}); ok {
+                    found = meta[key]
+                }
+            }
+        }
+        go! {
+            return stripeText(found)
+        }
+    }
+
+    #- A top-level string field (no path splitting). -#
+    func field(self, name: str) -> str {
+        found: any = None
+        go! {
+            if root, ok := lamJSONRaw(s.Data).(map[string]interface{}); ok {
+                found = root[name]
+            }
+        }
+        go! {
+            return stripeText(found)
+        }
+    }
+
+    func id(self) -> str {
+        return self.field("id")
+    }
+
+    #- Stripe's ``object`` discriminator (``"customer"``, ``"list"``, ...). -#
+    func objectType(self) -> str {
+        return self.field("object")
+    }
+
+    func url(self) -> str {
+        return self.field("url")
+    }
+
+    func clientSecret(self) -> str {
+        return self.field("client_secret")
+    }
+
+    func toJson(self) -> json {
+        return self.data
+    }
+}
+
+#- One successful API response: the decoded object plus HTTP details. -#
+class StripeResponse(StripeObject) {
+    func init(self, status: int = 0, body: str = "", transportError: str = "", headers: dict[str, list[str]] = {}) {
+        base.init(StripeResponse.decodeBody(body))
+        self.status: int = status
+        self.body: str = body
+        self.transportError: str = transportError
+        self.headers: dict[str, list[str]] = headers
+        #- ``Request-Id`` response header. -#
+        self.requestId: str = self.header("Request-Id")
+        #- ``Idempotency-Key`` sent ("" for none; auto-generated keys show here). -#
+        self.idempotencyKey: str = ""
+        #- Requests sent, retries included. -#
+        self.attempts: int = 1
+    }
+
+    static func decodeBody(body: str) -> json {
+        if body.trim() == "" {
+            return {}
+        }
+        decoded: Result[json] = Json.decode(body)
+        if decoded.ok() {
+            return decoded.unwrap()
+        }
+        return {}
+    }
+
+    func ok(self) -> bool {
+        return self.transportError == "" and self.status >= 200 and self.status < 300
+    }
+
+    #- The decoded body (``{}`` when empty or not JSON). -#
+    func json(self) -> json {
+        return self.data
+    }
+
+    #- First value of a response header (case-insensitive), or ``fallback``. -#
+    func header(self, name: str, fallback: str = "") -> str {
+        for headerName, values in self.headers {
+            if headerName.equalFold(name) and len(values) > 0 {
+                return values[0]
+            }
+        }
+        return fallback
+    }
+}
+
+#- One page of a Stripe list (``object: "list"``) or search result. -#
+class StripeList {
+    func init(self, response: StripeResponse) {
+        self.response: StripeResponse = response
+        self.data: list[StripeObject] = response.getList("data")
+        self.hasMore: bool = response.getBool("has_more")
+        self.url: str = response.getStr("url")
+        #- Search results only: the ``page`` token of the next page. -#
+        self.nextPage: str = response.getStr("next_page")
+    }
+
+    func size(self) -> int {
+        return len(self.data)
+    }
+
+    func isEmpty(self) -> bool {
+        return len(self.data) == 0
+    }
+
+    func first(self) -> StripeObject {
+        if len(self.data) == 0 {
+            return StripeObject()
+        }
+        return self.data[0]
+    }
+
+    func firstId(self) -> str {
+        if len(self.data) == 0 {
+            return ""
+        }
+        return self.data[0].id()
+    }
+
+    func lastId(self) -> str {
+        if len(self.data) == 0 {
+            return ""
+        }
+        return self.data[len(self.data) - 1].id()
+    }
+
+    func ids(self) -> list[str] {
+        out: list[str] = []
+        for item in self.data {
+            out.append(item.id())
+        }
+        return out
+    }
+}
+
+#- A Stripe event (webhook payload or ``GET /v1/events/:id``). -#
+class StripeEvent {
+    func init(self, raw: json = {}) {
+        view: StripeObject = StripeObject(raw)
+        self.raw: json = raw
+        self.id: str = view.getStr("id")
+        self.type: str = view.getStr("type")
+        self.created: int = view.getInt("created")
+        self.livemode: bool = view.getBool("livemode")
+        self.apiVersion: str = view.getStr("api_version")
+        #- Connected account the event belongs to ("" for the platform). -#
+        self.account: str = view.getStr("account")
+        self.pendingWebhooks: int = view.getInt("pending_webhooks")
+        #- Id of the API request that caused the event ("" for automatic events). -#
+        self.requestId: str = view.getStr("request.id")
+        self.requestIdempotencyKey: str = view.getStr("request.idempotency_key")
+        #- ``data.object``: the object the event is about. -#
+        self.object: json = view.getJson("data.object")
+        #- ``data.previous_attributes`` of ``*.updated`` events (JSON null otherwise). -#
+        self.previousAttributes: json = view.getJson("data.previous_attributes")
+    }
+
+    #- Parses a raw event body. Use ``StripeWebhook.constructEvent`` for
+       webhook requests so the signature is checked first. -#
+    static func parse(payload: str) -> Result[StripeEvent] {
+        decoded: Result[json] = Json.decode(payload)
+        if not decoded.ok() {
+            return Result.Err(StripeError.validation("event payload is not valid JSON", "payload"))
+        }
+        event: StripeEvent = StripeEvent(decoded.unwrap())
+        if event.id == "" or event.type == "" {
+            return Result.Err(StripeError.validation("event payload has no id or type", "payload"))
+        }
+        return Result.Ok(event)
+    }
+
+    #- ``data.object`` with the null-safe accessors of ``StripeObject``. -#
+    func dataObject(self) -> StripeObject {
+        return StripeObject(self.object)
+    }
+
+    #- ``data.object.<path>`` as text. -#
+    func objectStr(self, path: str) -> str {
+        return self.dataObject().getStr(path)
+    }
+
+    func objectInt(self, path: str) -> int {
+        return self.dataObject().getInt(path)
+    }
+
+    func objectBool(self, path: str) -> bool {
+        return self.dataObject().getBool(path)
+    }
+
+    #- Id of ``data.object``. -#
+    func objectId(self) -> str {
+        return self.dataObject().id()
+    }
+
+    #- ``object`` discriminator of ``data.object`` (``"subscription"``, ...). -#
+    func objectType(self) -> str {
+        return self.dataObject().objectType()
+    }
+
+    #- True when ``type`` equals ``eventType`` or matches a ``prefix.*`` pattern. -#
+    func isType(self, eventType: str) -> bool {
+        if eventType.endsWith(".*") {
+            return self.type.startsWith(eventType[: len(eventType) - 1])
+        }
+        return self.type == eventType
+    }
+
+    func wasUpdated(self, field: str) -> bool {
+        return StripeObject(self.previousAttributes).has(field)
+    }
+}

@@ -1,0 +1,87 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+
+from lamconv import Conv
+from lamenv import Env
+from lamerrors import Result
+from .errors import StripeError
+
+const StripeDefaultBaseUrl: str = "https://api.stripe.com/v1"
+
+#- Client settings. The constructor keeps the 0.x positional order
+   (``secretKey, baseUrl, apiVersion, timeoutMs``); the other settings are
+   named arguments or public fields. -#
+class StripeConfig {
+    func init(self, secretKey: str = "", baseUrl: str = "https://api.stripe.com/v1", apiVersion: str = "", timeoutMs: int = 30000, maxRetries: int = 2, stripeAccount: str = "") {
+        self.secretKey: str = secretKey
+        #- API root including ``/v1``; point it at a mock server in tests. -#
+        self.baseUrl: str = baseUrl
+        #- ``Stripe-Version`` header ("" uses the account's default version). -#
+        self.apiVersion: str = apiVersion
+        #- Per-attempt timeout in milliseconds. -#
+        self.timeoutMs: int = timeoutMs
+        #- Retries after the first attempt (0 disables retries). -#
+        self.maxRetries: int = maxRetries
+        self.retryBaseDelayMs: int = 500
+        self.retryMaxDelayMs: int = 5000
+        #- ``Stripe-Account`` header for Stripe Connect ("" for the platform). -#
+        self.stripeAccount: str = stripeAccount
+        #- Appended to the ``User-Agent`` header (``"myapp/1.2"``). -#
+        self.appInfo: str = ""
+        #- Give every POST without an explicit key a generated
+           ``Idempotency-Key`` so retries can never apply it twice. -#
+        self.autoIdempotencyKeys: bool = true
+    }
+
+    #- Reads ``STRIPE_SECRET_KEY``, ``STRIPE_BASE_URL``, ``STRIPE_API_VERSION``,
+       ``STRIPE_ACCOUNT``, ``STRIPE_TIMEOUT_MS`` and ``STRIPE_MAX_RETRIES``;
+       unset or malformed optional values keep their defaults. -#
+    static func fromEnv() -> StripeConfig {
+        cfg: StripeConfig = StripeConfig()
+        cfg.secretKey = Env.getOr("STRIPE_SECRET_KEY", "").trim()
+        cfg.baseUrl = Env.getOr("STRIPE_BASE_URL", StripeDefaultBaseUrl).trim()
+        if cfg.baseUrl == "" {
+            cfg.baseUrl = StripeDefaultBaseUrl
+        }
+        cfg.apiVersion = Env.getOr("STRIPE_API_VERSION", "").trim()
+        cfg.stripeAccount = Env.getOr("STRIPE_ACCOUNT", "").trim()
+        timeout: Result[int] = Conv.parse(Env.getOr("STRIPE_TIMEOUT_MS", "").trim())
+        if timeout.ok() and timeout.unwrap() > 0 {
+            cfg.timeoutMs = timeout.unwrap()
+        }
+        retries: Result[int] = Conv.parse(Env.getOr("STRIPE_MAX_RETRIES", "").trim())
+        if retries.ok() and retries.unwrap() >= 0 {
+            cfg.maxRetries = retries.unwrap()
+        }
+        return cfg
+    }
+
+    func isReady(self) -> bool {
+        return self.secretKey != ""
+    }
+
+    #- True for test-mode secret or restricted keys (``sk_test_``, ``rk_test_``). -#
+    func isTestMode(self) -> bool {
+        return self.secretKey.startsWith("sk_test_") or self.secretKey.startsWith("rk_test_")
+    }
+
+    func validate(self) -> Result[bool] {
+        if self.secretKey == "" {
+            return Result.Err(StripeError.config("STRIPE_SECRET_KEY is required"))
+        }
+        if self.secretKey.startsWith("pk_") {
+            return Result.Err(StripeError.config("a publishable key (pk_...) cannot call the Stripe API; use a secret or restricted key"))
+        }
+        base: str = self.baseUrl.toLower()
+        if not base.startsWith("https://") and not base.startsWith("http://") {
+            return Result.Err(StripeError.config(f"STRIPE_BASE_URL must be an http(s) URL, got {self.baseUrl}"))
+        }
+        if self.timeoutMs <= 0 {
+            return Result.Err(StripeError.config("timeoutMs must be greater than zero"))
+        }
+        if self.maxRetries < 0 or self.retryBaseDelayMs < 0 or self.retryMaxDelayMs < 0 {
+            return Result.Err(StripeError.config("retry settings must not be negative"))
+        }
+        return Result.Ok(true)
+    }
+}

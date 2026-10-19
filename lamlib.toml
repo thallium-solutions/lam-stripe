@@ -1,0 +1,14 @@
+[library]
+name = "@lam/stripe"
+version = "1.0.0"
+description = "Dependency-free Stripe API client for Lammergeier: typed Results, Billing (meters, prices, subscriptions), webhooks, retries and pagination"
+license = "Apache-2.0"
+authors = ["Lammergeier contributors"]
+repository = "https://github.com/thallium-solutions/lam-stripe"
+homepage = "https://github.com/thallium-solutions/lam-stripe"
+
+[compatibility]
+lamc = ">=2.1, <4"
+
+[scripts]
+test = "python3 tests/run_lamstripe_tests.py --verbose"

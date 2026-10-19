@@ -1,0 +1,628 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+
+from lamerrors import Result
+from .errors import StripeError
+from .util import Stripe
+
+#- ``POST /v1/customers`` fields. -#
+class StripeCustomerOptions {
+    func init(self, email: str, name: str = "") {
+        self.email: str = email
+        self.name: str = name
+        self.phone: str = ""
+        self.description: str = ""
+        self.metadata: dict[str, str] = {}
+    }
+
+    func setMetadata(self, key: str, value: str) {
+        self.metadata[key] = value
+    }
+
+    func fields(self) -> dict[str, str] {
+        out: dict[str, str] = {}
+        out["email"] = self.email
+        if self.name != "" {
+            out["name"] = self.name
+        }
+        if self.phone != "" {
+            out["phone"] = self.phone
+        }
+        if self.description != "" {
+            out["description"] = self.description
+        }
+        Stripe.addMetadata(out, self.metadata)
+        return out
+    }
+}
+
+#- ``POST /v1/payment_intents`` fields; ``automatic_payment_methods`` is on
+   by default and the currency is normalised to lower case. -#
+class StripePaymentIntentOptions {
+    func init(self, amount: int, currency: str) {
+        self.amount: int = amount
+        self.currency: str = currency
+        self.description: str = ""
+        self.customerId: str = ""
+        self.receiptEmail: str = ""
+        self.captureMethod: str = ""
+        self.automaticPaymentMethods: bool = true
+        self.metadata: dict[str, str] = {}
+    }
+
+    func setMetadata(self, key: str, value: str) {
+        self.metadata[key] = value
+    }
+
+    func fields(self) -> dict[str, str] {
+        out: dict[str, str] = {}
+        out["amount"] = str(self.amount)
+        out["currency"] = Stripe.normalizeCurrency(self.currency)
+        out["automatic_payment_methods[enabled]"] = str(self.automaticPaymentMethods).toLower()
+        if self.description != "" {
+            out["description"] = self.description
+        }
+        if self.customerId != "" {
+            out["customer"] = self.customerId
+        }
+        if self.receiptEmail != "" {
+            out["receipt_email"] = self.receiptEmail
+        }
+        if self.captureMethod != "" {
+            out["capture_method"] = self.captureMethod
+        }
+        Stripe.addMetadata(out, self.metadata)
+        return out
+    }
+
+    func validate(self) -> Result[bool] {
+        _ = Stripe.validateAmount(self.amount)?
+        _ = Stripe.validateCurrency(self.currency)?
+        return Result.Ok(true)
+    }
+}
+
+#- ``POST /v1/checkout/sessions`` fields for one-off payments and
+   subscriptions. ``priceId``/``quantity`` describe the first line item (as
+   in 0.x); ``addLineItem`` adds more. A quantity of 0 omits ``quantity``,
+   which metered (usage-based) prices require. -#
+class StripeCheckoutSessionOptions {
+    func init(self, successUrl: str, cancelUrl: str, priceId: str = "", quantity: int = 1) {
+        self.successUrl: str = successUrl
+        self.cancelUrl: str = cancelUrl
+        self.priceId: str = priceId
+        self.quantity: int = quantity
+        #- ``payment``, ``subscription`` or ``setup``. -#
+        self.mode: str = "payment"
+        self.customerId: str = ""
+        self.customerEmail: str = ""
+        self.clientReferenceId: str = ""
+        self.allowPromotionCodes: bool = false
+        self.locale: str = ""
+        #- Subscription mode: free trial length in days (0 for none). -#
+        self.trialPeriodDays: int = 0
+        self.metadata: dict[str, str] = {}
+        #- ``subscription_data[metadata]``: copied onto the created subscription. -#
+        self.subscriptionMetadata: dict[str, str] = {}
+        self.linePrices: list[str] = []
+        self.lineQuantities: list[int] = []
+    }
+
+    func setMetadata(self, key: str, value: str) {
+        self.metadata[key] = value
+    }
+
+    func setSubscriptionMetadata(self, key: str, value: str) -> StripeCheckoutSessionOptions {
+        self.subscriptionMetadata[key] = value
+        return self
+    }
+
+    func addLineItem(self, priceId: str, quantity: int = 1) -> StripeCheckoutSessionOptions {
+        self.linePrices.append(priceId)
+        self.lineQuantities.append(quantity)
+        return self
+    }
+
+    func lineItemCount(self) -> int {
+        count: int = len(self.linePrices)
+        if self.priceId != "" {
+            count += 1
+        }
+        return count
+    }
+
+    func validate(self) -> Result[bool] {
+        if self.successUrl.trim() == "" {
+            return Result.Err(StripeError.validation("successUrl is required", "success_url"))
+        }
+        if self.cancelUrl.trim() == "" {
+            return Result.Err(StripeError.validation("cancelUrl is required", "cancel_url"))
+        }
+        if self.mode != "payment" and self.mode != "subscription" and self.mode != "setup" {
+            return Result.Err(StripeError.validation(f"mode must be payment, subscription or setup, got {self.mode}", "mode"))
+        }
+        if self.mode != "setup" and self.lineItemCount() == 0 {
+            return Result.Err(StripeError.validation("priceId is required", "line_items"))
+        }
+        if self.priceId != "" and self.quantity <= 0 and self.mode == "payment" {
+            return Result.Err(StripeError.validation("quantity must be greater than zero", "line_items"))
+        }
+        for price in self.linePrices {
+            if price.trim() == "" {
+                return Result.Err(StripeError.validation("line item price is required", "line_items"))
+            }
+        }
+        if self.customerId != "" and self.customerEmail != "" {
+            return Result.Err(StripeError.validation("customerId and customerEmail are mutually exclusive", "customer"))
+        }
+        return Result.Ok(true)
+    }
+
+    func fields(self) -> dict[str, str] {
+        out: dict[str, str] = {}
+        out["success_url"] = self.successUrl
+        out["cancel_url"] = self.cancelUrl
+        out["mode"] = self.mode
+        index: int = 0
+        if self.priceId != "" {
+            out["line_items[0][price]"] = self.priceId
+            if self.quantity > 0 {
+                out["line_items[0][quantity]"] = str(self.quantity)
+            }
+            index = 1
+        }
+        for i in range(len(self.linePrices)) {
+            out[f"line_items[{index}][price]"] = self.linePrices[i]
+            if self.lineQuantities[i] > 0 {
+                out[f"line_items[{index}][quantity]"] = str(self.lineQuantities[i])
+            }
+            index += 1
+        }
+        if self.customerId != "" {
+            out["customer"] = self.customerId
+        }
+        if self.customerEmail != "" {
+            out["customer_email"] = self.customerEmail
+        }
+        if self.clientReferenceId != "" {
+            out["client_reference_id"] = self.clientReferenceId
+        }
+        if self.allowPromotionCodes {
+            out["allow_promotion_codes"] = "true"
+        }
+        if self.locale != "" {
+            out["locale"] = self.locale
+        }
+        if self.trialPeriodDays > 0 {
+            out["subscription_data[trial_period_days]"] = str(self.trialPeriodDays)
+        }
+        Stripe.addMetadata(out, self.metadata)
+        for k, v in self.subscriptionMetadata {
+            out["subscription_data[metadata][" + k + "]"] = v
+        }
+        return out
+    }
+}
+
+#- ``POST /v1/prices`` fields: flat, recurring, metered (Billing Meter) and
+   tiered (``graduated``/``volume``) prices. -#
+class StripePriceOptions {
+    func init(self, currency: str, productId: str) {
+        self.currency: str = currency
+        self.productId: str = productId
+        #- Amount in the currency's minor unit; -1 leaves it unset. -#
+        self.unitAmount: int = -1
+        #- Decimal minor-unit amount (``"0.05"``); "" leaves it unset. -#
+        self.unitAmountDecimal: str = ""
+        self.nickname: str = ""
+        self.lookupKey: str = ""
+        #- Move ``lookupKey`` from an existing price to this one. -#
+        self.transferLookupKey: bool = false
+        #- ``day``, ``week``, ``month`` or ``year``; "" for a one-off price. -#
+        self.recurringInterval: str = ""
+        self.recurringIntervalCount: int = 0
+        #- ``licensed`` or ``metered``. -#
+        self.usageType: str = ""
+        #- Billing Meter id of a metered price. -#
+        self.meterId: str = ""
+        #- ``graduated`` or ``volume`` (tiered prices). -#
+        self.tiersMode: str = ""
+        self.taxBehavior: str = ""
+        self.metadata: dict[str, str] = {}
+        self.tierUpTo: list[int] = []
+        self.tierUnitDecimal: list[str] = []
+        self.tierFlatDecimal: list[str] = []
+    }
+
+    func setMetadata(self, key: str, value: str) -> StripePriceOptions {
+        self.metadata[key] = value
+        return self
+    }
+
+    func recurring(self, interval: str, usageType: str = "licensed", meterId: str = "") -> StripePriceOptions {
+        self.recurringInterval = interval
+        self.usageType = usageType
+        self.meterId = meterId
+        return self
+    }
+
+    #- Adds a tier up to ``upTo`` units (``upTo <= 0`` is the open-ended
+       ``inf`` tier, which must come last). Amounts are decimal minor units. -#
+    func addTier(self, upTo: int, unitAmountDecimal: str, flatAmountDecimal: str = "") -> StripePriceOptions {
+        self.tierUpTo.append(upTo)
+        self.tierUnitDecimal.append(unitAmountDecimal)
+        self.tierFlatDecimal.append(flatAmountDecimal)
+        return self
+    }
+
+    func tierCount(self) -> int {
+        return len(self.tierUpTo)
+    }
+
+    func validate(self) -> Result[bool] {
+        _ = Stripe.validateCurrency(self.currency)?
+        if self.productId.trim() == "" {
+            return Result.Err(StripeError.validation("productId is required", "product"))
+        }
+        tiers: int = len(self.tierUpTo)
+        if tiers == 0 and self.unitAmount < 0 and self.unitAmountDecimal == "" {
+            return Result.Err(StripeError.validation("a unit amount or tiers are required", "unit_amount"))
+        }
+        if tiers > 0 {
+            if self.unitAmount >= 0 or self.unitAmountDecimal != "" {
+                return Result.Err(StripeError.validation("tiered prices cannot also set a unit amount", "unit_amount"))
+            }
+            if self.tiersMode != "graduated" and self.tiersMode != "volume" {
+                return Result.Err(StripeError.validation("tiersMode must be graduated or volume", "tiers_mode"))
+            }
+            for i in range(tiers) {
+                last: bool = i == tiers - 1
+                if last and self.tierUpTo[i] > 0 {
+                    return Result.Err(StripeError.validation("the last tier must be open-ended (upTo <= 0)", "tiers"))
+                }
+                if not last and self.tierUpTo[i] <= 0 {
+                    return Result.Err(StripeError.validation("only the last tier may be open-ended", "tiers"))
+                }
+                if i > 0 and not last and self.tierUpTo[i] <= self.tierUpTo[i - 1] {
+                    return Result.Err(StripeError.validation("tier limits must increase", "tiers"))
+                }
+            }
+        }
+        if self.usageType == "metered" and self.recurringInterval == "" {
+            return Result.Err(StripeError.validation("metered prices must be recurring", "recurring"))
+        }
+        return Result.Ok(true)
+    }
+
+    func fields(self) -> dict[str, str] {
+        out: dict[str, str] = {}
+        out["currency"] = Stripe.normalizeCurrency(self.currency)
+        out["product"] = self.productId
+        if self.unitAmount >= 0 {
+            out["unit_amount"] = str(self.unitAmount)
+        }
+        if self.unitAmountDecimal != "" {
+            out["unit_amount_decimal"] = self.unitAmountDecimal
+        }
+        if self.nickname != "" {
+            out["nickname"] = self.nickname
+        }
+        if self.lookupKey != "" {
+            out["lookup_key"] = self.lookupKey
+        }
+        if self.transferLookupKey {
+            out["transfer_lookup_key"] = "true"
+        }
+        if self.recurringInterval != "" {
+            out["recurring[interval]"] = self.recurringInterval
+            if self.recurringIntervalCount > 0 {
+                out["recurring[interval_count]"] = str(self.recurringIntervalCount)
+            }
+            if self.usageType != "" {
+                out["recurring[usage_type]"] = self.usageType
+            }
+            if self.meterId != "" {
+                out["recurring[meter]"] = self.meterId
+            }
+        }
+        if self.taxBehavior != "" {
+            out["tax_behavior"] = self.taxBehavior
+        }
+        if len(self.tierUpTo) > 0 {
+            out["billing_scheme"] = "tiered"
+            out["tiers_mode"] = self.tiersMode
+            for i in range(len(self.tierUpTo)) {
+                out[f"tiers[{i}][up_to]"] = "inf" if self.tierUpTo[i] <= 0 else str(self.tierUpTo[i])
+                if self.tierUnitDecimal[i] != "" {
+                    out[f"tiers[{i}][unit_amount_decimal]"] = self.tierUnitDecimal[i]
+                }
+                if self.tierFlatDecimal[i] != "" {
+                    out[f"tiers[{i}][flat_amount_decimal]"] = self.tierFlatDecimal[i]
+                }
+            }
+        }
+        Stripe.addMetadata(out, self.metadata)
+        return out
+    }
+}
+
+#- ``POST /v1/subscriptions/:id`` fields for plan changes: swap item prices
+   in place, add and delete items, with an explicit proration behaviour. -#
+class StripeSubscriptionUpdate {
+    func init(self, prorationBehavior: str = "create_prorations") {
+        #- ``create_prorations``, ``always_invoice`` or ``none``. -#
+        self.prorationBehavior: str = prorationBehavior
+        self.metadata: dict[str, str] = {}
+        #- ``""`` leaves it unchanged, ``"true"``/``"false"`` set it. -#
+        self.cancelAtPeriodEnd: str = ""
+        self.itemIds: list[str] = []
+        self.itemPrices: list[str] = []
+        self.itemQuantities: list[int] = []
+        self.itemDeleted: list[bool] = []
+    }
+
+    func setMetadata(self, key: str, value: str) -> StripeSubscriptionUpdate {
+        self.metadata[key] = value
+        return self
+    }
+
+    #- Moves the existing item ``itemId`` to ``priceId`` (quantity 0 keeps it). -#
+    func updateItem(self, itemId: str, priceId: str, quantity: int = 0) -> StripeSubscriptionUpdate {
+        self.itemIds.append(itemId)
+        self.itemPrices.append(priceId)
+        self.itemQuantities.append(quantity)
+        self.itemDeleted.append(false)
+        return self
+    }
+
+    #- Removes the existing item ``itemId``. -#
+    func deleteItem(self, itemId: str) -> StripeSubscriptionUpdate {
+        self.itemIds.append(itemId)
+        self.itemPrices.append("")
+        self.itemQuantities.append(0)
+        self.itemDeleted.append(true)
+        return self
+    }
+
+    #- Adds a new item (quantity 0 omits it, as metered prices require). -#
+    func addItem(self, priceId: str, quantity: int = 0) -> StripeSubscriptionUpdate {
+        self.itemIds.append("")
+        self.itemPrices.append(priceId)
+        self.itemQuantities.append(quantity)
+        self.itemDeleted.append(false)
+        return self
+    }
+
+    func itemCount(self) -> int {
+        return len(self.itemIds)
+    }
+
+    func validate(self) -> Result[bool] {
+        for i in range(len(self.itemIds)) {
+            if self.itemDeleted[i] and self.itemIds[i] == "" {
+                return Result.Err(StripeError.validation("deleteItem needs an item id", "items"))
+            }
+            if not self.itemDeleted[i] and self.itemIds[i] == "" and self.itemPrices[i] == "" {
+                return Result.Err(StripeError.validation("addItem needs a price id", "items"))
+            }
+        }
+        return Result.Ok(true)
+    }
+
+    func fields(self) -> dict[str, str] {
+        out: dict[str, str] = {}
+        if self.prorationBehavior != "" {
+            out["proration_behavior"] = self.prorationBehavior
+        }
+        if self.cancelAtPeriodEnd != "" {
+            out["cancel_at_period_end"] = self.cancelAtPeriodEnd
+        }
+        for i in range(len(self.itemIds)) {
+            if self.itemIds[i] != "" {
+                out[f"items[{i}][id]"] = self.itemIds[i]
+            }
+            if self.itemDeleted[i] {
+                out[f"items[{i}][deleted]"] = "true"
+                continue
+            }
+            if self.itemPrices[i] != "" {
+                out[f"items[{i}][price]"] = self.itemPrices[i]
+            }
+            if self.itemQuantities[i] > 0 {
+                out[f"items[{i}][quantity]"] = str(self.itemQuantities[i])
+            }
+        }
+        Stripe.addMetadata(out, self.metadata)
+        return out
+    }
+}
+
+#- Per-request settings that override the client configuration for one
+   call. Empty strings and ``-1`` keep the client defaults. -#
+class StripeRequestOptions {
+    func init(self, idempotencyKey: str = "") {
+        #- ``Idempotency-Key`` for this POST (wins over ``setIdempotencyKey``). -#
+        self.idempotencyKey: str = idempotencyKey
+        #- ``Stripe-Account`` for this request (Stripe Connect). -#
+        self.stripeAccount: str = ""
+        #- ``Stripe-Version`` for this request. -#
+        self.apiVersion: str = ""
+        #- Per-attempt timeout in milliseconds (0 keeps the client value). -#
+        self.timeoutMs: int = 0
+        #- Retries after the first attempt (-1 keeps the client value). -#
+        self.maxRetries: int = -1
+        #- Fields to expand (``expand[]``), e.g. ``"customer"``, ``"data.price"``. -#
+        self.expand: list[str] = []
+        #- Extra request headers. -#
+        self.headers: dict[str, str] = {}
+    }
+
+    func expandField(self, path: str) -> StripeRequestOptions {
+        self.expand.append(path)
+        return self
+    }
+
+    func header(self, name: str, value: str) -> StripeRequestOptions {
+        self.headers[name] = value
+        return self
+    }
+
+    func account(self, accountId: str) -> StripeRequestOptions {
+        self.stripeAccount = accountId
+        return self
+    }
+
+    func retries(self, count: int) -> StripeRequestOptions {
+        self.maxRetries = count
+        return self
+    }
+}
+
+#- ``POST /v1/products`` fields. -#
+class StripeProductOptions {
+    func init(self, name: str) {
+        self.name: str = name
+        self.description: str = ""
+        self.active: bool = true
+        self.taxCode: str = ""
+        self.unitLabel: str = ""
+        self.statementDescriptor: str = ""
+        self.metadata: dict[str, str] = {}
+    }
+
+    func setMetadata(self, key: str, value: str) -> StripeProductOptions {
+        self.metadata[key] = value
+        return self
+    }
+
+    func validate(self) -> Result[bool] {
+        if self.name.trim() == "" {
+            return Result.Err(StripeError.validation("product name is required", "name"))
+        }
+        return Result.Ok(true)
+    }
+
+    func fields(self) -> dict[str, str] {
+        out: dict[str, str] = {}
+        out["name"] = self.name
+        if not self.active {
+            out["active"] = "false"
+        }
+        if self.description != "" {
+            out["description"] = self.description
+        }
+        if self.taxCode != "" {
+            out["tax_code"] = self.taxCode
+        }
+        if self.unitLabel != "" {
+            out["unit_label"] = self.unitLabel
+        }
+        if self.statementDescriptor != "" {
+            out["statement_descriptor"] = self.statementDescriptor
+        }
+        Stripe.addMetadata(out, self.metadata)
+        return out
+    }
+}
+
+#- ``POST /v1/billing/meters`` fields. The defaults match the usual
+   usage-based setup: events are summed, the customer is found by id in
+   ``payload[stripe_customer_id]`` and the quantity is ``payload[value]``. -#
+class StripeMeterOptions {
+    func init(self, displayName: str, eventName: str) {
+        self.displayName: str = displayName
+        self.eventName: str = eventName
+        #- ``sum``, ``count`` or ``last``. -#
+        self.aggregation: str = "sum"
+        self.customerPayloadKey: str = "stripe_customer_id"
+        self.valuePayloadKey: str = "value"
+        #- Pre-aggregation window: ``day`` or ``hour``; "" for none. -#
+        self.eventTimeWindow: str = ""
+    }
+
+    func validate(self) -> Result[bool] {
+        if self.displayName.trim() == "" {
+            return Result.Err(StripeError.validation("meter display name is required", "display_name"))
+        }
+        if self.eventName.trim() == "" {
+            return Result.Err(StripeError.validation("meter event name is required", "event_name"))
+        }
+        if self.aggregation != "sum" and self.aggregation != "count" and self.aggregation != "last" {
+            return Result.Err(StripeError.validation(f"aggregation must be sum, count or last, got {self.aggregation}", "default_aggregation"))
+        }
+        return Result.Ok(true)
+    }
+
+    func fields(self) -> dict[str, str] {
+        out: dict[str, str] = {}
+        out["display_name"] = self.displayName
+        out["event_name"] = self.eventName
+        out["default_aggregation[formula]"] = self.aggregation
+        out["customer_mapping[type]"] = "by_id"
+        out["customer_mapping[event_payload_key]"] = self.customerPayloadKey
+        if self.aggregation != "count" {
+            out["value_settings[event_payload_key]"] = self.valuePayloadKey
+        }
+        if self.eventTimeWindow != "" {
+            out["event_time_window"] = self.eventTimeWindow
+        }
+        return out
+    }
+}
+
+#- ``POST /v1/billing/meter_events`` fields. ``identifier`` makes the
+   event unique for Stripe (a retried or replayed report with the same
+   identifier is counted once); it also becomes the ``Idempotency-Key``
+   unless the request sets one. ``timestamp`` 0 lets Stripe use the
+   receive time. -#
+class StripeMeterEventOptions {
+    func init(self, eventName: str, customerId: str, value: int) {
+        self.eventName: str = eventName
+        self.customerId: str = customerId
+        self.value: int = value
+        self.identifier: str = ""
+        self.timestamp: int = 0
+        self.customerPayloadKey: str = "stripe_customer_id"
+        self.valuePayloadKey: str = "value"
+        #- Extra ``payload[...]`` entries (dimensions). -#
+        self.payload: dict[str, str] = {}
+    }
+
+    func setPayload(self, key: str, value: str) -> StripeMeterEventOptions {
+        self.payload[key] = value
+        return self
+    }
+
+    func validate(self) -> Result[bool] {
+        if self.eventName.trim() == "" {
+            return Result.Err(StripeError.validation("meter event name is required", "event_name"))
+        }
+        if self.customerId.trim() == "" {
+            return Result.Err(StripeError.validation("customer id is required", "payload"))
+        }
+        if self.value < 0 {
+            return Result.Err(StripeError.validation("meter event value must not be negative", "payload"))
+        }
+        if len(self.identifier) > 100 {
+            return Result.Err(StripeError.validation("identifier must be at most 100 characters", "identifier"))
+        }
+        return Result.Ok(true)
+    }
+
+    func fields(self) -> dict[str, str] {
+        out: dict[str, str] = {}
+        out["event_name"] = self.eventName
+        for k, v in self.payload {
+            out["payload[" + k + "]"] = v
+        }
+        out["payload[" + self.customerPayloadKey + "]"] = self.customerId
+        out["payload[" + self.valuePayloadKey + "]"] = str(self.value)
+        if self.identifier != "" {
+            out["identifier"] = self.identifier
+        }
+        if self.timestamp > 0 {
+            out["timestamp"] = str(self.timestamp)
+        }
+        return out
+    }
+}

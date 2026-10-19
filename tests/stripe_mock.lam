@@ -1,0 +1,179 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Ephemeral local Stripe API mock shared by the offline tests (imported from
+# the test directory as ``from stripe_mock import ...``). Every request is
+# recorded, then answered by a Lam handler. Not part of the package.
+
+go! {
+    import (
+        "io"
+        "net"
+        "net/http"
+        "strconv"
+        "sync"
+        "time"
+    )
+
+    var stripeMockMu sync.Mutex
+    var stripeMockHandle func(*MockRequest) *MockReply
+    var stripeMockLog []*MockRequest
+    var stripeMockServer *http.Server
+}
+
+#- One recorded request. ``headers`` keeps the first value of each header
+   under its canonical name (``Idempotency-Key``, ``Stripe-Version``). -#
+class MockRequest {
+    func init(self, method: str = "", path: str = "", query: str = "", body: str = "", headers: dict[str, str] = {}) {
+        self.method: str = method
+        self.path: str = path
+        self.query: str = query
+        self.body: str = body
+        self.headers: dict[str, str] = headers
+    }
+
+    func header(self, name: str) -> str {
+        for key, value in self.headers {
+            if key.equalFold(name) {
+                return value
+            }
+        }
+        return ""
+    }
+
+    #- The form body of a POST, or the query string otherwise. -#
+    func params(self) -> str {
+        return self.body if self.method == "POST" else self.query
+    }
+}
+
+class MockReply {
+    func init(self, status: int = 200, body: str = "{}", headers: dict[str, str] = {}, delayMs: int = 0) {
+        self.status: int = status
+        self.body: str = body
+        self.headers: dict[str, str] = headers
+        self.delayMs: int = delayMs
+    }
+
+    static func json(body: str, status: int = 200) -> MockReply {
+        return MockReply(status, body)
+    }
+
+    static func error(status: int, errorType: str, message: str, code: str = "") -> MockReply {
+        body: str = "{\"error\":{\"type\":\"" + errorType + "\",\"message\":\"" + message + "\""
+        if code != "" {
+            body = body + ",\"code\":\"" + code + "\""
+        }
+        return MockReply(status, body + "}}", {"Request-Id": "req_mock_error"})
+    }
+}
+
+class StripeMock {
+    func init(self) {
+        self.baseUrl: str = ""
+    }
+
+    #- Starts the mock on an ephemeral 127.0.0.1 port; ``handler`` answers
+       every request (they are recorded first). -#
+    static func start(handler: func(MockRequest) -> MockReply) -> StripeMock {
+        mock: StripeMock = StripeMock()
+        url: str = ""
+        go! {
+            stripeMockMu.Lock()
+            stripeMockHandle = handler
+            stripeMockLog = nil
+            stripeMockMu.Unlock()
+            listener, err := net.Listen("tcp", "127.0.0.1:0")
+            if err != nil {
+                panic(err)
+            }
+            mux := http.NewServeMux()
+            mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+                raw, _ := io.ReadAll(r.Body)
+                _ = r.Body.Close()
+                headers := map[string]string{}
+                for name, values := range r.Header {
+                    if len(values) > 0 {
+                        headers[name] = values[0]
+                    }
+                }
+                rec := NewMockRequest(r.Method, r.URL.Path, r.URL.RawQuery, string(raw), headers)
+                stripeMockMu.Lock()
+                stripeMockLog = append(stripeMockLog, rec)
+                handle := stripeMockHandle
+                stripeMockMu.Unlock()
+                reply := handle(rec)
+                if reply.DelayMs > 0 {
+                    time.Sleep(time.Duration(reply.DelayMs) * time.Millisecond)
+                }
+                for name, value := range reply.Headers {
+                    w.Header().Set(name, value)
+                }
+                w.Header().Set("Content-Type", "application/json")
+                if w.Header().Get("Request-Id") == "" {
+                    w.Header().Set("Request-Id", "req_mock_"+strconv.Itoa(len(stripeMockLog)))
+                }
+                w.WriteHeader(reply.Status)
+                _, _ = io.WriteString(w, reply.Body)
+            })
+            stripeMockServer = &http.Server{Handler: mux}
+            go func() { _ = stripeMockServer.Serve(listener) }()
+            url = "http://" + listener.Addr().String() + "/v1"
+        }
+        mock.baseUrl = url
+        return mock
+    }
+
+    func stop(self) {
+        go! {
+            if stripeMockServer != nil {
+                _ = stripeMockServer.Close()
+            }
+        }
+    }
+
+    func count(self) -> int {
+        n: int = 0
+        go! {
+            stripeMockMu.Lock()
+            n = len(stripeMockLog)
+            stripeMockMu.Unlock()
+        }
+        return n
+    }
+
+    func requests(self) -> list[MockRequest] {
+        out: list[MockRequest] = []
+        go! {
+            stripeMockMu.Lock()
+            out = append(out, stripeMockLog...)
+            stripeMockMu.Unlock()
+        }
+        return out
+    }
+
+    func last(self) -> MockRequest {
+        all: list[MockRequest] = self.requests()
+        if len(all) == 0 {
+            return MockRequest()
+        }
+        return all[len(all) - 1]
+    }
+
+    #- Requests whose method and path match (path without ``/v1``). -#
+    func matching(self, method: str, path: str) -> list[MockRequest] {
+        return [r for r in self.requests() if r.method == method and r.path == "/v1" + path]
+    }
+
+    func reset(self) {
+        go! {
+            stripeMockMu.Lock()
+            stripeMockLog = nil
+            stripeMockMu.Unlock()
+        }
+    }
+}
+
+func main() {
+    pass
+}
