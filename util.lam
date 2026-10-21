@@ -119,7 +119,7 @@ go! {
     }
 }
 
-const StripeLibraryVersion: str = "1.0.0"
+const StripeLibraryVersion: str = "1.0.1"
 
 #- Static helpers: form encoding, validation and retry policy. -#
 class Stripe {

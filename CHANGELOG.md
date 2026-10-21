@@ -4,6 +4,13 @@ All notable changes to `@lam/stripe` are documented here. Versions follow
 [Semantic Versioning](https://semver.org/) and are tagged without a `v`
 prefix (`1.0.0`).
 
+## [1.0.1] - 2026-10-21
+
+### Changed
+
+- Requires `lamc` 3.0 (`>=3.0, <4`); the compiler notes are gone: every limitation they described is fixed in 3.0.
+- Tests use a `match` class pattern on the re-exported `StripeError`.
+
 ## 1.0.0
 
 First release as an official Lammergeier library. It replaces the vendored

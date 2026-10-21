@@ -1,9 +1,9 @@
 # expect: StripeConfigError 0
 # expect: Bearer sk_test_requests
 # expect: true true true
-# expect: lam-stripe/1.0.0 (Lammergeier; +https://github.com/thallium-solutions/lam-stripe) billing-app/2.0
+# expect: lam-stripe/1.0.1 (Lammergeier; +https://github.com/thallium-solutions/lam-stripe) billing-app/2.0
 # expect: 2024-06-20 acct_platform application/x-www-form-urlencoded
-# expect: lammergeier 1.0.0
+# expect: lammergeier 1.0.1
 # expect: true
 # expect: [] true
 # expect: sticky-1 sticky-1
@@ -74,7 +74,7 @@ func main() {
     first: MockRequest = mock.last()
     print(first.header("Authorization"))
     ua: str = first.header("User-Agent")
-    print(ua.startsWith("lam-stripe/1.0.0"), not ua.contains("lamstripe/0.1.0"), created.idempotencyKey == first.header("Idempotency-Key"))
+    print(ua.startsWith("lam-stripe/" + Stripe.version()), not ua.contains("lamstripe/0.1.0"), created.idempotencyKey == first.header("Idempotency-Key"))
     print(ua)
     print(first.header("Stripe-Version"), first.header("Stripe-Account"), first.header("Content-Type"))
     clientUa: json = Json.decode(first.header("X-Stripe-Client-User-Agent")).unwrap()

@@ -39,23 +39,22 @@ that compiles to Go.
 - [Security notes](#security-notes)
 - [Testing](#testing)
 - [Upgrading from lamstripe 0.x](#upgrading-from-lamstripe-0x)
-- [Compiler notes](#compiler-notes)
 - [License](#license)
 
 ## Install
 
-Requires `lamc` 2.1 or newer. Add the dependency to your project's
+Requires `lamc` 3.0 or newer. Add the dependency to your project's
 `lamlib.toml`:
 
 ```toml
 [dependencies]
-"@lam/stripe" = { git = "https://github.com/thallium-solutions/lam-stripe.git", ref = "1.0.0" }
+"@lam/stripe" = { git = "https://github.com/thallium-solutions/lam-stripe.git", ref = "1.0.1" }
 ```
 
 and run `lamc install`, or install it directly:
 
 ```sh
-lamc install https://github.com/thallium-solutions/lam-stripe.git@1.0.0
+lamc install https://github.com/thallium-solutions/lam-stripe.git@1.0.1
 ```
 
 Import from the scoped package:
@@ -572,7 +571,7 @@ python3 tests/run_lamstripe_tests.py --verbose          # or: lamc lib run test
 python3 tests/run_lamstripe_tests.py webhook retries    # name filters
 ```
 
-The runner uses `lamc` from `PATH` (2.1.0 or newer), copies the package
+The runner uses `lamc` from `PATH` (3.0.0 or newer), copies the package
 into a temporary `extlibs/@lam/stripe` and compiles every `tests/test_*.lam`
 against it, exactly as an installed dependency. Offline tests use
 ephemeral local mock servers and never see your `STRIPE_*` variables.
@@ -595,24 +594,6 @@ LAMSTRIPE_LIVE_TESTS=1 STRIPE_SECRET_KEY=sk_test_... python3 tests/run_lamstripe
   `StripeConnectionError` instead of `HttpError`.
 - Retries and generated idempotency keys are on by default.
 - Environment variable names are unchanged.
-
-## Compiler notes
-
-Written against the released `lamc` 2.1.1. Contributors should know these
-compiler limitations, which the library code avoids:
-
-- A local variable named like a Go package used by the program (`http`,
-  `strings`, ...) is treated as the package: `http.header(...)` is emitted
-  unmangled. Use another name.
-- A `match` class pattern (`case StripeError() as se`) does not accept a
-  class re-exported through a package `__init__.lam`; use
-  `isinstance(err, StripeError)` or `StripeError.of(err)`.
-- An inline list comprehension used as an operand (`[...][1:]`,
-  `[...].reduce(...)`) loses its element type; assign it to a typed local
-  first.
-- `list == list` literals do not compile; compare joined strings or loop.
-- `lamc fmt` rewrites double-backtick spans inside `//` comments of `go!`
-  blocks into typographic quotes, so it is not run on this repository.
 
 ## License
 

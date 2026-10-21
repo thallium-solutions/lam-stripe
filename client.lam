@@ -132,7 +132,6 @@ class StripeClient {
         while true {
             attempts += 1
             self.requestCount += 1
-            # Not named ``http``: see the README's compiler notes.
             wire: HttpRequestOptions = HttpRequestOptions(timeoutMs)
             for name, value in headers {
                 wire.header(name, value)

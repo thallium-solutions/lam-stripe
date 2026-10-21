@@ -31,12 +31,14 @@ func pipeline(amount: int) -> Result[int] {
 }
 
 func describe(err: any) -> str {
-    # ``isinstance`` narrows; a ``match`` class pattern on a re-exported
-    # class is rejected by lamc 2.1.1 (see the README's compiler notes).
-    if isinstance(err, StripeError) {
-        return f"narrowed {err.kind} {err.code}"
+    match err {
+        case StripeError() as se {
+            return f"narrowed {se.kind} {se.code}"
+        }
+        case _ {
+            return "other"
+        }
     }
-    return "other"
 }
 
 func main() {
