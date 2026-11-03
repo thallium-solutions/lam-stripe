@@ -4,6 +4,12 @@ All notable changes to `@lam/stripe` are documented here. Versions follow
 [Semantic Versioning](https://semver.org/) and are tagged without a `v`
 prefix (`1.0.0`).
 
+## [1.0.2] - 2026-11-03
+
+### Changed
+
+- Compatible with `lamc` 4.x: `compatibility.lamc = ">=3.0, <5"` (test runner too).
+
 ## [1.0.1] - 2026-10-21
 
 ### Changed
