@@ -1,0 +1,165 @@
+# The client methods no other test calls, against the in-process Stripe
+# mock: the generic `request`, `delete`, `rawDelete` and `list`, payment
+# intents and checkout sessions built from positional arguments, product
+# options, prices and lookup keys (and their 1..10 bound), meter events,
+# subscriptions and events listings. Non-ASCII descriptions and metadata
+# are form-encoded as UTF-8. Then 16 async tasks, each with its own client
+# (the README's rule for concurrent workers), create payment intents with
+# distinct idempotency keys, and a `BillingService` class composes the
+# calls with `?` and `do/catch`. The library version reported to Stripe is
+# the released one.
+#
+# expect: request: PATCH /v1/things/x a=1
+# expect: delete: DELETE /v1/coupons/co_1 reason=dup
+# expect: rawDelete: DELETE /v1/customers/cus_9/discount
+# expect: list: GET /v1/coupons limit=2 size=2 hasMore=true first=co_1
+# expect: payment intent: POST /v1/payment_intents amount=1999&automatic_payment_methods[enabled]=true&currency=eur&description=Café für Zoë 🦅
+# expect: checkout: POST /v1/checkout/sessions cancel_url=https://shop.test/cancel&line_items[0][price]=price_1&line_items[0][quantity]=2&mode=subscription&success_url=https://shop.test/ok
+# expect: checkout retrieve: GET /v1/checkout/sessions/cs_1 expand[]=line_items
+# expect: product: POST /v1/products description=Tee 🍵&metadata[tier]=gold&name=Thé vert
+# expect: inactive product: POST /v1/products active=false&name=Archive
+# expect: product retrieve: GET /v1/products/prod_1
+# expect: price retrieve: GET /v1/prices/price_1 expand[]=product
+# expect: lookup keys: GET /v1/prices active=true&limit=100&lookup_keys[]=basic&lookup_keys[]=pro first=price_1
+# expect: lookup bounds: StripeValidationError StripeValidationError
+# expect: meter event: POST /v1/billing/meter_events event_name=api_calls&identifier=evt-42&payload[stripe_customer_id]=cus_1&payload[value]=7&timestamp=1700000000 key=evt-42
+# expect: subscriptions: GET /v1/subscriptions customer=cus_1&status=active
+# expect: events: GET /v1/events type=invoice.paid
+# expect: concurrent intents: 16 ok, 16 distinct keys, 16 requests
+# expect: billing: subscribed cus_1 with price_1; missing customer: StripeInvalidRequestError resource_missing
+# expect: version: true
+# expect: ok
+
+from @lam/stripe import StripeClient, StripeConfig, StripeResponse, StripeList, StripeRequestOptions, StripeError, Stripe, StripeProductOptions
+from stripe_mock import StripeMock, MockRequest, MockReply
+from lamerrors import Result
+
+func handle(req: MockRequest) -> MockReply {
+    if req.path == "/v1/coupons" and req.method == "GET" {
+        return MockReply.json("{\"object\":\"list\",\"url\":\"/v1/coupons\",\"has_more\":true,\"data\":[{\"id\":\"co_1\",\"object\":\"coupon\"},{\"id\":\"co_2\",\"object\":\"coupon\"}]}")
+    }
+    if req.path == "/v1/prices" and req.method == "GET" {
+        return MockReply.json("{\"object\":\"list\",\"url\":\"/v1/prices\",\"has_more\":false,\"data\":[{\"id\":\"price_1\",\"object\":\"price\",\"lookup_key\":\"basic\"}]}")
+    }
+    if req.path == "/v1/customers/cus_missing" {
+        return MockReply.error(404, "invalid_request_error", "No such customer: 'cus_missing'", "resource_missing")
+    }
+    if req.path == "/v1/subscriptions" and req.method == "GET" {
+        return MockReply.json("{\"object\":\"list\",\"url\":\"/v1/subscriptions\",\"has_more\":false,\"data\":[]}")
+    }
+    if req.path == "/v1/events" {
+        return MockReply.json("{\"object\":\"list\",\"url\":\"/v1/events\",\"has_more\":false,\"data\":[]}")
+    }
+    if req.path.startsWith("/v1/customers/") {
+        return MockReply.json("{\"id\":\"" + req.path[len("/v1/customers/"):] + "\",\"object\":\"customer\"}")
+    }
+    return MockReply.json("{\"id\":\"obj_1\",\"object\":\"thing\"}")
+}
+
+func readable(text: str) -> str {
+    out: str = ""
+    go! {
+        import "net/url"
+        out, _ = url.QueryUnescape(text)
+    }
+    return out
+}
+
+func line(req: MockRequest) -> str {
+    return f"{req.method} {req.path} {readable(req.params())}".trim()
+}
+
+#- A thin billing service an application would write over the client. -#
+class BillingService {
+    func init(self, client: StripeClient) {
+        self.client: StripeClient = client
+    }
+
+    func subscribe(self, customerId: str, lookupKey: str) -> Result[str] {
+        customer: StripeResponse = self.client.retrieveCustomer(customerId)?
+        prices: StripeList = self.client.listPricesByLookupKeys([lookupKey])?
+        if prices.isEmpty() {
+            return Result.Err(StripeError.validation(f"no price for {lookupKey}", "lookup_key"))
+        }
+        return Result.Ok(f"subscribed {customer.getStr('id')} with {prices.firstId()}")
+    }
+}
+
+async func intentTask(baseUrl: str, i: int) -> Result[StripeResponse] {
+    client: StripeClient = StripeClient(StripeConfig("sk_test_tasks", baseUrl))
+    return client.createPaymentIntent(100 + i, "eur", f"task {i}")
+}
+
+func main() {
+    mock: StripeMock = StripeMock.start(handle)
+    client: StripeClient = StripeClient(StripeConfig("sk_test_more", mock.baseUrl))
+
+    _ = client.request("patch", "/things/x", {"a": 1}).unwrap()
+    print(f"request: {line(mock.last())}")
+    _ = client.delete("/coupons/co_1", {"reason": "dup"}).unwrap()
+    print(f"delete: {line(mock.last())}")
+    _ = client.rawDelete("/customers/cus_9/discount").unwrap()
+    print(f"rawDelete: {line(mock.last())}")
+    coupons: StripeList = client.list("/coupons", {"limit": 2}).unwrap()
+    print(f"list: {line(mock.last())} size={coupons.size()} hasMore={coupons.hasMore} first={coupons.firstId()}")
+
+    _ = client.createPaymentIntent(1999, "eur", "Café für Zoë 🦅").unwrap()
+    print(f"payment intent: {line(mock.last())}")
+    _ = client.createCheckoutSession("https://shop.test/ok", "https://shop.test/cancel", "subscription", "price_1", 2).unwrap()
+    print(f"checkout: {line(mock.last())}")
+    _ = client.retrieveCheckoutSession("cs_1", ["line_items"]).unwrap()
+    print(f"checkout retrieve: {line(mock.last())}")
+
+    product: StripeProductOptions = StripeProductOptions("Thé vert").setMetadata("tier", "gold")
+    product.description = "Tee 🍵"
+    _ = client.createProductWithOptions(product).unwrap()
+    print(f"product: {line(mock.last())}")
+    archived: StripeProductOptions = StripeProductOptions("Archive")
+    archived.active = false
+    _ = client.createProductWithOptions(archived).unwrap()
+    print(f"inactive product: {line(mock.last())}")
+    _ = client.retrieveProduct("prod_1").unwrap()
+    print(f"product retrieve: {line(mock.last())}")
+    _ = client.retrievePrice("price_1", ["product"]).unwrap()
+    print(f"price retrieve: {line(mock.last())}")
+    prices: StripeList = client.listPricesByLookupKeys(["basic", "pro"]).unwrap()
+    print(f"lookup keys: {line(mock.last())} first={prices.firstId()}")
+    tooMany: list[str] = [f"k{i}" for i in range(11)]
+    print(f"lookup bounds: {client.listPricesByLookupKeys([]).error.kind} {client.listPricesByLookupKeys(tooMany).error.kind}")
+
+    _ = client.createMeterEvent("api_calls", "cus_1", 7, "evt-42", 1700000000).unwrap()
+    meter: MockRequest = mock.last()
+    print(f"meter event: {line(meter)} key={meter.header('Idempotency-Key')}")
+    _ = client.listSubscriptions({"customer": "cus_1", "status": "active"}).unwrap()
+    print(f"subscriptions: {line(mock.last())}")
+    _ = client.listEvents({"type": "invoice.paid"}).unwrap()
+    print(f"events: {line(mock.last())}")
+
+    before: int = mock.count()
+    pending = [intentTask(mock.baseUrl, i) for i in range(16)]
+    responses: list[StripeResponse] = []
+    for task in pending {
+        r: Result[StripeResponse] = await task
+        if r.ok() {
+            responses.append(r.unwrap())
+        }
+    }
+    keys: set[str] = set([r.idempotencyKey for r in responses])
+    print(f"concurrent intents: {len(responses)} ok, {len(keys)} distinct keys, {mock.count() - before} requests")
+
+    billing: BillingService = BillingService(client)
+    summary: str = billing.subscribe("cus_1", "basic").unwrapOr("failed")
+    missing: str = ""
+    do {
+        _ = billing.subscribe("cus_missing", "basic")?
+        missing = "found"
+    } catch err {
+        failure: StripeError = StripeError.of(err)
+        missing = f"{failure.kind} {failure.code}"
+    }
+    print(f"billing: {summary}; missing customer: {missing}")
+
+    print(f"version: {Stripe.version() == '1.0.3' and Stripe.userAgent().startsWith('lam-stripe/1.0.3 ')}")
+    mock.stop()
+    print("ok")
+}

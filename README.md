@@ -48,13 +48,13 @@ Requires `lamc` 3.0 or newer. Add the dependency to your project's
 
 ```toml
 [dependencies]
-"@lam/stripe" = { git = "https://github.com/thallium-solutions/lam-stripe.git", ref = "1.0.1" }
+"@lam/stripe" = { git = "https://github.com/thallium-solutions/lam-stripe.git", ref = "1.0.3" }
 ```
 
 and run `lamc install`, or install it directly:
 
 ```sh
-lamc install https://github.com/thallium-solutions/lam-stripe.git@1.0.1
+lamc install https://github.com/thallium-solutions/lam-stripe.git@1.0.3
 ```
 
 Import from the scoped package:

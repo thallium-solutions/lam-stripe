@@ -1,6 +1,6 @@
 [library]
 name = "@lam/stripe"
-version = "1.0.2"
+version = "1.0.3"
 description = "Dependency-free Stripe API client for Lammergeier: typed Results, Billing (meters, prices, subscriptions), webhooks, retries and pagination"
 license = "Apache-2.0"
 authors = ["Lammergeier contributors"]

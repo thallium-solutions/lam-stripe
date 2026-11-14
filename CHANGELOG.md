@@ -4,6 +4,28 @@ All notable changes to `@lam/stripe` are documented here. Versions follow
 [Semantic Versioning](https://semver.org/) and are tagged without a `v`
 prefix (`1.0.0`).
 
+## [1.0.3] - 2026-11-14
+
+### Fixed
+
+- `Stripe.version()`, the `User-Agent` and `X-Stripe-Client-User-Agent`
+  report the released version: `StripeLibraryVersion` was still `1.0.1` in
+  1.0.2. `tests/test_client_endpoints_more.lam` and
+  `tests/test_client_requests.lam` check it, so the next release must bump it
+  together with `lamlib.toml`.
+
+### Tests
+
+- `tests/test_client_endpoints_more.lam`: the client methods no test called
+  (`request`, `delete`, `rawDelete`, `list`, `createPaymentIntent`,
+  `createCheckoutSession`, `retrieveCheckoutSession`,
+  `createProductWithOptions` with active and inactive products,
+  `retrieveProduct`, `retrievePrice`, `listPricesByLookupKeys` and its 1..10
+  bound, `createMeterEvent`, `listSubscriptions`, `listEvents`) against the
+  mock, non-ASCII form values, 16 async tasks with their own clients creating
+  payment intents with distinct idempotency keys, and a `BillingService`
+  class composing calls with `?` and `do/catch`.
+
 ## [1.0.2] - 2026-11-03
 
 ### Changed
